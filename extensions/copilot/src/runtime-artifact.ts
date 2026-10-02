@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import type { StdioRuntimeConnection } from "@github/copilot-sdk";
 import type { AgentHarnessRuntimeArtifactBinding } from "openclaw/plugin-sdk/agent-harness-runtime";
-import { extractErrorCode } from "openclaw/plugin-sdk/error-runtime";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { fingerprintCopilotPackage, loadCopilotSdkWithIdentity } from "./sdk-loader.js";
 
@@ -27,18 +27,13 @@ async function resolveRuntimePackage(entryPath: string, packageName: string): Pr
   // Resolve the SDK's own optional dependency afresh: require.resolve caches
   // symlink targets, which would hide a replaced installation during validation.
   const lookupPaths = createRequire(entryPath).resolve.paths(packageName) ?? [];
-  for (const lookupPath of lookupPaths) {
-    const candidate = path.join(lookupPath, packageName);
-    try {
-      await fs.access(path.join(candidate, "package.json"));
-      return await fs.realpath(candidate);
-    } catch (error) {
-      if (extractErrorCode(error) !== "ENOENT") {
-        throw error;
-      }
-    }
+  const packageRoot = lookupPaths
+    .map((lookupPath) => path.join(lookupPath, packageName))
+    .find((candidate) => existsSync(path.join(candidate, "package.json")));
+  if (!packageRoot) {
+    throw new Error(`Copilot runtime package ${packageName} is not installed.`);
   }
-  throw new Error(`Copilot runtime package ${packageName} is not installed.`);
+  return await fs.realpath(packageRoot);
 }
 
 export async function captureCopilotRuntimeArtifact(env: NodeJS.ProcessEnv = process.env): Promise<{
@@ -59,16 +54,6 @@ export async function captureCopilotRuntimeArtifact(env: NodeJS.ProcessEnv = pro
   }
   const platform = runtimePlatform();
   const packageName = `@github/copilot-sdk-${platform}`;
-  const sdkManifest: unknown = JSON.parse(
-    await fs.readFile(path.join(identity.packageRoot, "package.json"), "utf8"),
-  );
-  if (
-    !isRecord(sdkManifest) ||
-    !isRecord(sdkManifest.optionalDependencies) ||
-    !sdkManifest.optionalDependencies[packageName]
-  ) {
-    throw new Error(`The installed Copilot SDK does not declare runtime package ${packageName}.`);
-  }
   const packageRoot = await resolveRuntimePackage(identity.entryPath, packageName);
   // The SDK publishes its native runtime as an optional platform package. Pin
   // that packaged executable through the SDK's public RuntimeConnection API.

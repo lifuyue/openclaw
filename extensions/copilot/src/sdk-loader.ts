@@ -44,7 +44,6 @@ function unchanged(before: BigIntStats, after: BigIntStats): boolean {
 export async function fingerprintCopilotPackage(packageRoot: string): Promise<string> {
   const hash = createHash("sha256");
   async function visit(directory: string): Promise<void> {
-    const beforeDirectory = await fs.stat(directory, { bigint: true });
     const entries = await fs.readdir(directory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
@@ -56,34 +55,21 @@ export async function fingerprintCopilotPackage(packageRoot: string): Promise<st
         await visit(filePath);
       } else if (entry.isFile() || entry.isSymbolicLink()) {
         // Plugin generations link native artifacts into immutable capture trees.
-        const beforeLink = await fs.lstat(filePath, { bigint: true });
         const target = await fs.realpath(filePath);
         const before = await fs.stat(target, { bigint: true });
-        if (!before.isFile()) {
-          throw new Error(`Copilot runtime artifact is not a regular file: ${filePath}`);
-        }
         const contents = await sha256File(target, { maxBytes: Number(before.size) });
         if (
-          !unchanged(beforeLink, await fs.lstat(filePath, { bigint: true })) ||
           (await fs.realpath(filePath)) !== target ||
           !unchanged(before, await fs.stat(target, { bigint: true })) ||
           BigInt(contents.bytes) !== before.size
         ) {
           throw new Error("Copilot runtime package changed while fingerprinting.");
         }
-        hash.update(path.relative(packageRoot, filePath).split(path.sep).join("/"));
-        hash
-          .update("\0")
-          .update(String(before.mode))
-          .update("\0")
-          .update(contents.digest)
-          .update("\0");
+        const relativePath = path.relative(packageRoot, filePath).split(path.sep).join("/");
+        hash.update(`${relativePath}\0${before.mode}\0${contents.digest}\0`);
       } else {
         throw new Error(`Copilot runtime package contains an unsupported file: ${filePath}`);
       }
-    }
-    if (!unchanged(beforeDirectory, await fs.stat(directory, { bigint: true }))) {
-      throw new Error("Copilot runtime package changed while fingerprinting.");
     }
   }
   await visit(packageRoot);

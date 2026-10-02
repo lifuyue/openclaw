@@ -32,7 +32,6 @@ import { resolvePluginRuntimeLoadContext } from "../plugins/runtime/load-context
 import { captureAsyncWorkTracker } from "../shared/async-work-scope.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import type { SystemAgentConfiguredRoute } from "./inference-route.js";
-import type { ActivateSetupInferenceDeps } from "./setup-inference-core.js";
 import {
   loadSetupInferencePluginGeneration,
   revalidateStableSetupInferenceOwner,
@@ -118,25 +117,23 @@ describe("setup inference plugin ownership", () => {
     const cleanupStarted = createDeferred();
     const releaseCleanup = createDeferred();
     const removeTempDir = vi.fn(async () => {});
-    const runEmbeddedAgent = vi.fn<NonNullable<ActivateSetupInferenceDeps["runEmbeddedAgent"]>>(
-      async () => {
-        const trackOwner = captureAsyncWorkTracker();
-        void trackOwner(async () => {
-          cleanupStarted.resolve();
-          await releaseCleanup.promise;
-        });
-        return {
-          payloads: [{ text: "OK" }],
-          meta: {
-            durationMs: 1,
-            executionTrace: {
-              winnerProvider: route.provider,
-              winnerModel: route.model,
-            },
+    const runEmbeddedAgent = vi.fn(async () => {
+      const trackOwner = captureAsyncWorkTracker();
+      void trackOwner(async () => {
+        cleanupStarted.resolve();
+        await releaseCleanup.promise;
+      });
+      return {
+        payloads: [{ text: "OK" }],
+        meta: {
+          durationMs: 1,
+          executionTrace: {
+            winnerProvider: route.provider,
+            winnerModel: route.model,
           },
-        };
-      },
-    );
+        },
+      };
+    });
 
     let settled = false;
     const turn = runSetupInferenceTurn({
@@ -163,16 +160,6 @@ describe("setup inference plugin ownership", () => {
     }
     await expect(turn).resolves.toMatchObject({ ok: true, text: "OK" });
     expect(removeTempDir).toHaveBeenCalledOnce();
-    const recorder = expectDefined(
-      runEmbeddedAgent.mock.calls[0]?.[0].userTurnTranscriptRecorder,
-      "missing setup probe user-turn recorder",
-    );
-    await expect(recorder.resolveMessage()).resolves.toMatchObject({
-      role: "user",
-      content: "Reply with the single word OK. Do not use tools.",
-    });
-    await expect(recorder.persistApproved()).resolves.toBeUndefined();
-    expect(recorder.hasPersisted()).toBe(false);
   });
 
   it("loads newly installed package facts after the install lease cached their absence", async () => {

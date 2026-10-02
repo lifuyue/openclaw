@@ -342,7 +342,6 @@ export function createAttemptTranscriptJournal(params: {
       for (const message of messages) {
         results.push(await appendInMemoryMessage(staged.sessionManager, message!));
       }
-      assertMemoryOwnerCurrent();
       await staged.commit(new Map());
     } else {
       results = await appendSessionTranscriptMessagesByIdentity({

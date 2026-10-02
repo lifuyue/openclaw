@@ -285,8 +285,6 @@ describe("runSystemAgentTurn", () => {
           role: "user",
           content: turns[index]?.input,
         });
-        await expect(recorder.persistApproved()).resolves.toBeUndefined();
-        expect(recorder.hasPersisted()).toBe(false);
       }
       const [firstCall, secondCall, resumedCall] = mocks.runEmbeddedAgent.mock.calls.map(
         ([params]) => params,

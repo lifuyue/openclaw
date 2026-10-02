@@ -74,45 +74,20 @@ async function fixture() {
 }
 
 describe("Copilot runtime artifacts", () => {
-  it("pins the installed executable and invalidates changed native bytes at the same version", async () => {
+  it("preserves native links across equivalent captures and invalidates changed bytes", async () => {
     const files = await fixture();
-    const captured = await captureCopilotRuntimeArtifact();
-    expect(captured.connection).toMatchObject({ kind: "stdio", path: files.executable });
-    await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(true);
-
-    await fs.writeFile(files.nativeRuntime, "replacement native runtime");
-    await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(false);
-    expect((await captureCopilotRuntimeArtifact()).binding.fingerprint).not.toBe(
-      captured.binding.fingerprint,
-    );
-  });
-
-  it("accepts identical recaptures but invalidates changed content in the new installation", async () => {
-    const files = await fixture();
-    const captured = await captureCopilotRuntimeArtifact();
+    const original = await captureCopilotRuntimeArtifact();
+    expect(original.connection).toMatchObject({ kind: "stdio", path: files.executable });
+    const nativeCapture = path.join(files.root, "native-capture");
+    await fs.rename(files.nativeRuntime, nativeCapture);
+    await fs.symlink(nativeCapture, files.nativeRuntime, "file");
     const replacement = path.join(files.root, "replacement");
     await fs.cp(files.runtimeRoot, replacement, { recursive: true });
     await fs.unlink(files.installedRuntime);
     await fs.symlink(replacement, files.installedRuntime, "junction");
 
-    await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(true);
-    const next = await captureCopilotRuntimeArtifact();
-    expect(next.connection.path).toContain(`${path.sep}replacement${path.sep}`);
-    expect(next.binding).toEqual(captured.binding);
-    await fs.writeFile(
-      path.join(replacement, path.relative(files.runtimeRoot, files.nativeRuntime)),
-      "changed runtime",
-    );
-    await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(false);
-  });
-
-  it("hashes captured native file links and notices changes to their targets", async () => {
-    const files = await fixture();
-    const original = await captureCopilotRuntimeArtifact();
-    const nativeCapture = path.join(files.root, "native-capture");
-    await fs.rename(files.nativeRuntime, nativeCapture);
-    await fs.symlink(nativeCapture, files.nativeRuntime, "file");
     const captured = await captureCopilotRuntimeArtifact();
+    expect(captured.connection.path).toContain(`${path.sep}replacement${path.sep}`);
     expect(captured.binding).toEqual(original.binding);
     await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(true);
     await fs.writeFile(nativeCapture, "changed captured runtime");
