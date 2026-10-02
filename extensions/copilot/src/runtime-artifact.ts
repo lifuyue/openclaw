@@ -86,7 +86,10 @@ export async function captureCopilotRuntimeArtifact(env: NodeJS.ProcessEnv = pro
     );
   }
   const runtimeFingerprint = await fingerprintCopilotPackage(packageRoot);
-  const id = `copilot-sdk:${JSON.stringify([identity.entryPath, executable])}`;
+  // Setup revalidation uses a fresh plugin generation with different capture
+  // paths. Identify the implementation bytes, not a temporary snapshot location.
+  const entry = path.relative(identity.packageRoot, identity.entryPath).split(path.sep).join("/");
+  const id = `copilot-sdk:${platform}:${entry}`;
   const fingerprint = createHash("sha256")
     .update(JSON.stringify([id, identity.fingerprint, runtimeFingerprint]))
     .digest("hex");

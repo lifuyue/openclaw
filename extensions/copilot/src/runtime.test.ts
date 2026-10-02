@@ -135,7 +135,7 @@ describe("createCopilotClientPool", () => {
     } finally {
       await pool.dispose();
     }
-    expect(sdk.stops.toSorted()).toEqual([1, 2]);
+    expect(sdk.stops.toSorted((left, right) => left - right)).toEqual([1, 2]);
   });
 
   it("stops a client whose runtime changes during awaited startup", async () => {
@@ -145,7 +145,7 @@ describe("createCopilotClientPool", () => {
     const pool = createCopilotClientPool({
       sdkFactory: async (options) => {
         const client = await sdk.fake(options);
-        vi.mocked(client.start).mockImplementation(async () => {
+        client.start = vi.fn(async () => {
           started.resolve();
           await startup.promise;
         });

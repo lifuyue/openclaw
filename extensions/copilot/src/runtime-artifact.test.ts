@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { RuntimeConnection } from "@github/copilot-sdk";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import {
   captureCopilotRuntimeArtifact,
   validateCopilotRuntimeArtifact,
@@ -87,7 +87,7 @@ describe("Copilot runtime artifacts", () => {
     );
   });
 
-  it("invalidates a retargeted installation even when the package bytes match", async () => {
+  it("accepts identical recaptures but invalidates changed content in the new installation", async () => {
     const files = await fixture();
     const captured = await captureCopilotRuntimeArtifact();
     const replacement = path.join(files.root, "replacement");
@@ -95,10 +95,28 @@ describe("Copilot runtime artifacts", () => {
     await fs.unlink(files.installedRuntime);
     await fs.symlink(replacement, files.installedRuntime, "junction");
 
-    await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(false);
+    await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(true);
     const next = await captureCopilotRuntimeArtifact();
     expect(next.connection.path).toContain(`${path.sep}replacement${path.sep}`);
-    expect(next.binding.id).not.toBe(captured.binding.id);
+    expect(next.binding).toEqual(captured.binding);
+    await fs.writeFile(
+      path.join(replacement, path.relative(files.runtimeRoot, files.nativeRuntime)),
+      "changed runtime",
+    );
+    await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(false);
+  });
+
+  it("hashes captured native file links and notices changes to their targets", async () => {
+    const files = await fixture();
+    const original = await captureCopilotRuntimeArtifact();
+    const nativeCapture = path.join(files.root, "native-capture");
+    await fs.rename(files.nativeRuntime, nativeCapture);
+    await fs.symlink(nativeCapture, files.nativeRuntime, "file");
+    const captured = await captureCopilotRuntimeArtifact();
+    expect(captured.binding).toEqual(original.binding);
+    await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(true);
+    await fs.writeFile(nativeCapture, "changed captured runtime");
+    await expect(validateCopilotRuntimeArtifact(captured.binding)).resolves.toBe(false);
   });
 
   it("requires restart when the loaded SDK changes on disk", async () => {

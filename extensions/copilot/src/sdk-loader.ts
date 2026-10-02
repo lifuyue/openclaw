@@ -54,11 +54,19 @@ export async function fingerprintCopilotPackage(packageRoot: string): Promise<st
       const filePath = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(filePath);
-      } else if (entry.isFile()) {
-        const before = await fs.lstat(filePath, { bigint: true });
-        const contents = await sha256File(filePath, { maxBytes: Number(before.size) });
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
+        // Plugin generations link native artifacts into immutable capture trees.
+        const beforeLink = await fs.lstat(filePath, { bigint: true });
+        const target = await fs.realpath(filePath);
+        const before = await fs.stat(target, { bigint: true });
+        if (!before.isFile()) {
+          throw new Error(`Copilot runtime artifact is not a regular file: ${filePath}`);
+        }
+        const contents = await sha256File(target, { maxBytes: Number(before.size) });
         if (
-          !unchanged(before, await fs.lstat(filePath, { bigint: true })) ||
+          !unchanged(beforeLink, await fs.lstat(filePath, { bigint: true })) ||
+          (await fs.realpath(filePath)) !== target ||
+          !unchanged(before, await fs.stat(target, { bigint: true })) ||
           BigInt(contents.bytes) !== before.size
         ) {
           throw new Error("Copilot runtime package changed while fingerprinting.");
@@ -82,8 +90,8 @@ export async function fingerprintCopilotPackage(packageRoot: string): Promise<st
   return hash.digest("hex");
 }
 
-async function importInstalledSdk(entryPath: string): Promise<LoadedCopilotSdk> {
-  entryPath = await fs.realpath(entryPath);
+async function importInstalledSdk(selectedEntry: string): Promise<LoadedCopilotSdk> {
+  const entryPath = await fs.realpath(selectedEntry);
   const previous = installedImports.get(entryPath);
   if (previous) {
     return previous;
