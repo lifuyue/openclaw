@@ -68,6 +68,12 @@ The runtime resolves the SDK in this order:
 A missing SDK surfaces one error with code `COPILOT_SDK_MISSING` and the
 reinstall command above.
 
+Setup verification binds the installed SDK and packaged native runtime to the
+verified session. Replacing either implementation invalidates that binding;
+restart OpenClaw after an SDK update and repeat verification. Verified setup
+currently requires the SDK's packaged stdio runtime; a custom `COPILOT_CLI_PATH`
+outside that bundle or an in-process default transport cannot supply this binding.
+
 ## Quickstart
 
 Pin one model (or one provider) to the harness:
