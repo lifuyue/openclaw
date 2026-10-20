@@ -7,7 +7,8 @@ import type { ClientCreateOptions, PoolKey } from "./runtime.js";
 import { createCopilotClientPool } from "./runtime.js";
 
 const artifactMock = vi.hoisted(() => ({ capture: vi.fn(), validate: vi.fn() }));
-vi.mock("./runtime-artifact.js", () => ({
+vi.mock("./runtime-artifact.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./runtime-artifact.js")>()),
   captureCopilotRuntimeArtifact: artifactMock.capture,
   validateCopilotRuntimeArtifact: artifactMock.validate,
 }));

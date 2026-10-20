@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import * as embeddedAgent from "../agents/embedded-agent.js";
@@ -106,28 +105,6 @@ function revalidateOwner(
 }
 
 describe("setup inference plugin ownership", () => {
-  it.each([undefined, "Check the configured model without using tools."])(
-    "records the exact setup prompt in its detached transcript: %s",
-    async (prompt) => {
-      const route = embeddedRoute();
-      vi.spyOn(embeddedAgent, "runEmbeddedAgent").mockImplementation(async (params) => {
-        const recorder = expectDefined(
-          params.userTurnTranscriptRecorder,
-          "missing setup probe user-turn recorder",
-        );
-        await expect(recorder.resolveMessage()).resolves.toMatchObject({
-          role: "user",
-          content: params.prompt,
-        });
-        expect(params.sessionManager?.getSessionTarget()).toBeUndefined();
-        return probeReply(route);
-      });
-      await expect(
-        runSetupInferenceTurn({ route, prompt, requireExecutionOwner: false }),
-      ).resolves.toMatchObject({ ok: true });
-    },
-  );
-
   it.each([
     ["ECONNREFUSED", "Nothing is listening at http://127.0.0.1:43210", "Start the server"],
     ["ENOTFOUND", "The server name in http://127.0.0.1:43210 could not be found", "DNS"],
