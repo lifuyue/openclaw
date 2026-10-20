@@ -4,6 +4,7 @@ import {
   type WhatsAppQaDriverSession,
 } from "@openclaw/whatsapp/api.js";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { sleep } from "openclaw/plugin-sdk/runtime-env";
 import type { WhatsAppQaMessageScenarioContext } from "./whatsapp-live.contracts.js";
 import {
   isWhatsAppScenarioSutMessage,
@@ -47,9 +48,7 @@ export async function waitForNoWhatsAppReply(
     windowMs: number;
   } & WhatsAppQaNoReplyTarget,
 ) {
-  await new Promise((resolve) => {
-    setTimeout(resolve, params.windowMs);
-  });
+  await sleep(params.windowMs);
   const observedAfterMs = params.observedAfter.getTime();
   const unexpectedReply = params.driver.getObservedMessages().find((message) => {
     if (new Date(message.observedAt).getTime() <= observedAfterMs) {
@@ -153,7 +152,7 @@ export async function restartWhatsAppQaDriverSession(params: {
 }
 
 export async function startWhatsAppQaDriverSessionWithRetry(params: { authDir: string }) {
-  for (let attempt = 1; attempt <= WHATSAPP_QA_TRANSIENT_DRIVER_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; ; attempt += 1) {
     try {
       return await startWhatsAppQaDriverSession({
         authDir: params.authDir,
@@ -166,10 +165,7 @@ export async function startWhatsAppQaDriverSessionWithRetry(params: { authDir: s
       ) {
         throw error;
       }
-      await new Promise((resolve) => {
-        setTimeout(resolve, WHATSAPP_QA_DRIVER_RECONNECT_DELAY_MS);
-      });
+      await sleep(WHATSAPP_QA_DRIVER_RECONNECT_DELAY_MS);
     }
   }
-  throw new Error("unreachable WhatsApp QA driver retry loop exit");
 }

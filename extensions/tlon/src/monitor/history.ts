@@ -20,25 +20,16 @@ type TlonHistoryEntry = {
   author: string;
   content: string;
   timestamp: number;
-  id?: string;
 };
 
 function createHistoryEntryFromMemo(params: {
   memo?: Record<string, unknown> | null;
-  seal?: Record<string, unknown> | null;
-  fallbackId?: unknown;
 }): TlonHistoryEntry {
-  const { memo, seal, fallbackId } = params;
+  const { memo } = params;
   return {
     author: typeof memo?.author === "string" ? memo.author : "unknown",
     content: extractMessageText(memo?.content || []),
     timestamp: typeof memo?.sent === "number" ? memo.sent : Date.now(),
-    id:
-      typeof seal?.id === "string"
-        ? seal.id
-        : typeof fallbackId === "string"
-          ? fallbackId
-          : undefined,
   };
 }
 
@@ -59,18 +50,10 @@ async function fetchChannelHistory(
       return [];
     }
 
-    let posts: unknown[] = [];
-    if (Array.isArray(data)) {
-      posts = data;
-    } else {
-      const dataRecord = asRecord(data);
-      const postMap = asRecord(dataRecord?.posts);
-      if (postMap) {
-        posts = Object.values(postMap);
-      } else if (dataRecord) {
-        posts = Object.values(dataRecord);
-      }
-    }
+    const dataRecord = asRecord(data);
+    const posts = Array.isArray(data)
+      ? data
+      : Object.values(asRecord(dataRecord?.posts) ?? dataRecord ?? {});
 
     const messages = posts
       .map((item) => {
@@ -78,9 +61,8 @@ async function fetchChannelHistory(
         const replyPost = asRecord(itemRecord?.["r-post"]);
         const replyPostSet = asRecord(replyPost?.set);
         const essay = asRecord(itemRecord?.essay) ?? asRecord(replyPostSet?.essay);
-        const seal = asRecord(itemRecord?.seal) ?? asRecord(replyPostSet?.seal);
 
-        return createHistoryEntryFromMemo({ memo: essay, seal });
+        return createHistoryEntryFromMemo({ memo: essay });
       })
       .filter((msg) => msg.content);
 
@@ -148,10 +130,6 @@ export async function fetchThreadRootAuthor(
   }
 }
 
-/**
- * Fetch thread/reply history for a specific parent post.
- * Used to get context when entering a thread conversation.
- */
 export async function fetchThreadHistory(
   api: { scry: (path: string) => Promise<unknown> },
   channelNest: string,
@@ -160,8 +138,6 @@ export async function fetchThreadHistory(
   runtime?: RuntimeEnv,
 ): Promise<TlonHistoryEntry[]> {
   try {
-    // Tlon API: fetch replies to a specific post
-    // Format: /channels/v4/{nest}/posts/post/{parentId}/replies/newest/{count}.json
     // parentId needs @ud formatting (dots every 3 digits)
     const formattedParentId = formatUd(parentId);
     runtime?.log?.(
@@ -192,16 +168,15 @@ export async function fetchThreadHistory(
       }
     }
 
+    // Thread replies use 'memo' structure
     const messages = replies
       .map((item) => {
-        // Thread replies use 'memo' structure
         const itemRecord = asRecord(item);
         const replyRecord = asRecord(itemRecord?.["r-reply"]);
         const replySet = asRecord(replyRecord?.set);
         const memo = asRecord(itemRecord?.memo) ?? asRecord(replySet?.memo) ?? itemRecord;
-        const seal = asRecord(itemRecord?.seal) ?? asRecord(replySet?.seal);
 
-        return createHistoryEntryFromMemo({ memo, seal, fallbackId: itemRecord?.id });
+        return createHistoryEntryFromMemo({ memo });
       })
       .filter((msg) => msg.content);
 
@@ -209,7 +184,6 @@ export async function fetchThreadHistory(
     return messages;
   } catch (error: unknown) {
     runtime?.log?.(`[tlon] Error fetching thread history: ${formatErrorMessage(error)}`);
-    // Fall back to trying alternate path structure
     try {
       const altPath = `/channels/v4/${channelNest}/posts/post/id/${formatUd(parentId)}.json`;
       runtime?.log?.(`[tlon] Trying alternate path: ${altPath}`);
@@ -226,8 +200,7 @@ export async function fetchThreadHistory(
           .map((reply: unknown) => {
             const replyRecord = asRecord(reply);
             const memo = asRecord(replyRecord?.memo);
-            const seal = asRecord(replyRecord?.seal);
-            return createHistoryEntryFromMemo({ memo, seal });
+            return createHistoryEntryFromMemo({ memo });
           })
           .filter((msg: TlonHistoryEntry) => msg.content);
 

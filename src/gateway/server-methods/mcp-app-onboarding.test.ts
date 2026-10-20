@@ -8,6 +8,7 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import * as pluginMetadata from "../../plugins/current-plugin-metadata-state.js";
 import { createPluginMetadataSnapshotFixture } from "../../plugins/plugin-metadata.test-support.js";
+import { rpcSourceTesting } from "../../sessions/session-lifecycle-admission.test-support.js";
 import { createCoreGatewayMethodDescriptors } from "../methods/core-method-policy.js";
 import { createGatewayMethodRegistry } from "../methods/registry.js";
 import { handleGatewayRequest } from "../server-methods.js";
@@ -61,10 +62,11 @@ it.each(["success", "caller-revoked", "session-replaced", "native-denied"] as co
     const release = vi.fn();
     vi.spyOn(sessionAccess, "prepareGatewaySessionAccessAuthority").mockImplementation(
       async (params) => {
-        access = await prepareAccess(params);
+        const prepared = await prepareAccess(params);
+        access = prepared.authority;
         release.mockImplementation(access.release);
         access.release = release;
-        return access;
+        return prepared;
       },
     );
     let chat: GatewayRequestHandlerOptions | undefined;
@@ -144,8 +146,7 @@ it.each(["success", "caller-revoked", "session-replaced", "native-denied"] as co
           );
         }
       }
-      expect(fixture.context.chatAbortControllers.size).toBe(0);
-      expect(fixture.context.chatQueuedTurns.size).toBe(0);
+      expect(rpcSourceTesting.size).toBe(0);
     } finally {
       await fixture.cleanup();
       projection.dispose();

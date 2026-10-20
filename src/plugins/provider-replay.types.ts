@@ -25,6 +25,8 @@ export type ProviderReplayPolicy = {
   preserveSignatures?: boolean;
   /** Keep per-turn runtime context in place to preserve signed thinking prefixes. */
   appendOnlyRuntimeContext?: boolean;
+  /** Append system-authority updates instead of rewriting the stable prompt prefix. */
+  inHistorySystemUpdates?: boolean;
   sanitizeThoughtSignatures?: {
     allowBase64Only?: boolean;
     includeCamelCase?: boolean;
@@ -53,6 +55,8 @@ export type ProviderReplayPolicyContext = {
   modelId?: string;
   modelApi?: string | null;
   model?: ProviderRuntimeModel;
+  /** Host-resolved model, endpoint, and authentication eligibility. */
+  inHistorySystemUpdates?: boolean;
 };
 
 export type ProviderReplaySessionEntry = {
@@ -60,9 +64,10 @@ export type ProviderReplaySessionEntry = {
   data?: unknown;
 };
 
+/** @deprecated Use ProviderReplaySessionStateV2; final compatibility day: 2026-12-31. Removal in the first January 2027 stable release. */
 export type ProviderReplaySessionState = {
   getCustomEntries(): ProviderReplaySessionEntry[];
-  /** @deprecated Use ProviderReplaySessionStateV2.appendCustomEntryAsync; removed at the next Plugin SDK major. */
+  /** @deprecated Use ProviderReplaySessionStateV2.appendCustomEntryAsync; final compatibility day: 2026-12-31. Removal in the first January 2027 stable release. */
   appendCustomEntry(customType: string, data: unknown): void;
 };
 
@@ -76,6 +81,7 @@ export type ProviderReplaySessionStateV2 = ProviderReplaySessionState & {
  *
  * Runs after core applies generic transcript cleanup so plugins can make
  * provider-specific replay rewrites without owning the whole compaction flow.
+ * @deprecated Use ProviderSanitizeReplayHistoryContextV2; final compatibility day: 2026-12-31. Removal in the first January 2027 stable release.
  */
 export type ProviderSanitizeReplayHistoryContext = ProviderReplayPolicyContext & {
   sessionId: string;

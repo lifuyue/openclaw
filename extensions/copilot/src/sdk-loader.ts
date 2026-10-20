@@ -9,10 +9,6 @@ import { sha256File } from "openclaw/plugin-sdk/file-access-runtime";
 import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import copilotPluginPackage from "../package.json" with { type: "json" };
 
-function resolveCopilotSdkFallbackDir(env: NodeJS.ProcessEnv = process.env): string {
-  return path.join(resolveStateDir(env), "npm-runtime", "copilot");
-}
-
 const COPILOT_SDK_SPEC = `@github/copilot-sdk@${copilotPluginPackage.dependencies["@github/copilot-sdk"]}`;
 
 export type CopilotSdkIdentity = Readonly<{
@@ -99,7 +95,11 @@ async function importInstalledSdk(selectedEntry: string): Promise<LoadedCopilotS
   }
   const fingerprint = await fingerprintCopilotPackage(packageRoot);
   const loaded = (async (): Promise<LoadedCopilotSdk> => {
-    const sdk = (await import(pathToFileURL(entryPath).href)) as typeof Sdk;
+    const sdk = (await import(pathToFileURL(entryPath).href).catch((error: unknown) => {
+      // A failed import has no implementation identity to retain; allow install/repair retries.
+      installedImports.delete(entryPath);
+      throw error;
+    })) as typeof Sdk;
     if ((await fingerprintCopilotPackage(packageRoot)) !== fingerprint) {
       throw new Error(
         "Copilot SDK changed while loading. Restart OpenClaw before verifying inference.",
@@ -112,66 +112,50 @@ async function importInstalledSdk(selectedEntry: string): Promise<LoadedCopilotS
   return loaded;
 }
 
-interface LoadCopilotSdkOptions {
-  readonly fallbackDir?: string;
-  readonly primaryImport?: () => Promise<typeof Sdk>;
-  readonly fallbackImport?: (absolutePath: string) => Promise<typeof Sdk>;
-  readonly cache?: boolean;
-}
-
-export async function loadCopilotSdk(options: LoadCopilotSdkOptions = {}): Promise<typeof Sdk> {
-  return (await loadSdk(options)).sdk;
+export async function loadCopilotSdk(
+  options: { primaryImport?: () => Promise<typeof Sdk> } = {},
+): Promise<typeof Sdk> {
+  return (await loadSdk(options.primaryImport)).sdk;
 }
 
 export async function loadCopilotSdkWithIdentity(): Promise<{
   sdk: typeof Sdk;
   identity: CopilotSdkIdentity;
 }> {
-  const loaded = await loadSdk({});
+  const loaded = await loadSdk();
   if (!loaded.identity) {
     throw new Error("The loaded Copilot SDK has no installed implementation identity.");
   }
   return { sdk: loaded.sdk, identity: loaded.identity };
 }
 
-async function loadSdk(options: LoadCopilotSdkOptions): Promise<LoadedCopilotSdk> {
-  const useCache = options.cache !== false;
-  if (useCache && cached) {
-    return cached;
-  }
-
-  const promise = doLoad(options);
-  if (useCache) {
-    cached = promise.catch((err: unknown) => {
+async function loadSdk(primaryImport?: () => Promise<typeof Sdk>): Promise<LoadedCopilotSdk> {
+  if (!cached) {
+    cached = doLoad(primaryImport).catch((err: unknown) => {
       cached = undefined;
       throw err;
     });
-    return cached;
   }
-  return promise;
+  return cached;
 }
 
-async function doLoad(options: LoadCopilotSdkOptions): Promise<LoadedCopilotSdk> {
-  const fallbackDir = options.fallbackDir ?? resolveCopilotSdkFallbackDir();
-
+async function doLoad(primaryImport?: () => Promise<typeof Sdk>): Promise<LoadedCopilotSdk> {
   let primaryErr: unknown;
   try {
-    return options.primaryImport
-      ? { sdk: await options.primaryImport() }
+    return primaryImport
+      ? { sdk: await primaryImport() }
       : await importInstalledSdk(fileURLToPath(import.meta.resolve("@github/copilot-sdk")));
   } catch (err) {
     primaryErr = err;
   }
 
+  const fallbackDir = path.join(resolveStateDir(), "npm-runtime", "copilot");
   const fallbackPath = path.join(fallbackDir, "node_modules", "@github", "copilot-sdk");
   if (!existsSync(fallbackPath)) {
     throw createMissingSdkError(primaryErr, undefined, fallbackPath);
   }
 
   try {
-    if (options.fallbackImport) {
-      return { sdk: await options.fallbackImport(fallbackPath) };
-    }
     // Node ESM rejects directory imports; resolve the concrete installed entry.
     const requireFromFallback = createRequire(path.join(fallbackDir, "package.json"));
     const entry = requireFromFallback.resolve("@github/copilot-sdk");

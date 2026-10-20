@@ -77,13 +77,9 @@ export function resolvePerplexityWebSearchRuntimeMetadata(
 }
 
 export function isDirectPerplexityBaseUrl(baseUrl: string): boolean {
-  try {
-    return (
-      normalizeLowercaseStringOrEmpty(new URL(baseUrl.trim()).hostname) === "api.perplexity.ai"
-    );
-  } catch {
-    return false;
-  }
+  return (
+    normalizeLowercaseStringOrEmpty(URL.parse(baseUrl.trim())?.hostname) === "api.perplexity.ai"
+  );
 }
 
 export function resolvePerplexityConfig(searchConfig?: Record<string, unknown>): PerplexityConfig {
@@ -99,7 +95,7 @@ export function hasPerplexityLegacyOverride(perplexity?: PerplexityConfig): bool
 export function resolvePerplexityRuntime(
   perplexity: PerplexityConfig | undefined,
   auth: PerplexityAuth,
-): PerplexityAuth & { baseUrl: string; model: string; transport: PerplexityTransport } {
+): { apiKey?: string; baseUrl: string; model: string; transport: PerplexityTransport } {
   const baseUrl =
     normalizeOptionalString(perplexity?.baseUrl) ||
     (auth.source === "perplexity_env" ||
@@ -108,7 +104,6 @@ export function resolvePerplexityRuntime(
       : DEFAULT_PERPLEXITY_BASE_URL);
   return {
     apiKey: auth.apiKey,
-    source: auth.source,
     baseUrl,
     model: normalizeOptionalString(perplexity?.model) || DEFAULT_PERPLEXITY_MODEL,
     transport:

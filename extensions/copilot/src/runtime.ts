@@ -38,36 +38,18 @@ export interface CopilotClientPoolOptions {
   readonly idleTtlMs?: number;
 }
 
-export interface CopilotClientPool {
-  acquire(
-    key: PoolKey,
-    options: ClientCreateOptions,
-    runtimeArtifactRequest?: { expected?: AgentHarnessRuntimeArtifactBinding },
-  ): Promise<PooledClient>;
-  release(handle: PooledClient): Promise<void>;
-  dispose(): Promise<Error[]>;
-  size(): number;
-}
-
-type EntryState =
-  | { kind: "creating"; promise: Promise<CopilotClient> }
-  | { kind: "ready"; client: CopilotClient }
-  | {
-      kind: "idle";
-      client: CopilotClient;
-      idleTimer: ReturnType<typeof setTimeout>;
-    }
-  | { kind: "stopping"; client: CopilotClient; promise: Promise<Error[]> }
-  | { kind: "stopped" };
+export type CopilotClientPool = ReturnType<typeof createCopilotClientPool>;
 
 interface PoolEntry {
   readonly key: PoolKey;
   readonly cacheKey: string;
+  readonly client: Promise<CopilotClient>;
   refCount: number;
-  state: EntryState;
+  idleTimer?: ReturnType<typeof setTimeout>;
+  stopping?: Promise<Error[]>;
 }
 
-export function createCopilotClientPool(options: CopilotClientPoolOptions = {}): CopilotClientPool {
+export function createCopilotClientPool(options: CopilotClientPoolOptions = {}) {
   const sdkFactory =
     options.sdkFactory ??
     (async (clientOptions: CopilotClientOptions) => {
@@ -78,9 +60,7 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}):
   const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
   const entries = new Map<string, PoolEntry>();
   const releasedHandles = new WeakSet<PooledClient>();
-  let disposed = false;
   let disposePromise: Promise<Error[]> | undefined;
-  let disposeCompleted = false;
 
   const createDisposedError = () => new Error(POOL_DISPOSED_MESSAGE);
 
@@ -90,64 +70,22 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}):
     }
   };
 
-  const stopReadyOrIdleEntry = (
-    entry: PoolEntry,
-    client: CopilotClient,
-    idleTimer?: ReturnType<typeof setTimeout>,
-  ) => {
-    if (idleTimer) {
-      clearTimeout(idleTimer);
+  const stopEntry = (entry: PoolEntry): Promise<Error[]> => {
+    if (entry.stopping) {
+      return entry.stopping;
     }
-    const stopPromise = (async () => {
+    clearTimeout(entry.idleTimer);
+    entry.stopping = (async () => {
       try {
+        const client = await entry.client;
         return await client.stop();
       } catch (error: unknown) {
         return [toCopilotRuntimeError(error)];
       } finally {
-        entry.state = { kind: "stopped" };
         maybeDeleteEntry(entry);
       }
     })();
-
-    entry.state = { kind: "stopping", client, promise: stopPromise };
-    return stopPromise;
-  };
-
-  const stopEntry = async (entry: PoolEntry): Promise<Error[]> => {
-    switch (entry.state.kind) {
-      case "creating": {
-        try {
-          await entry.state.promise;
-        } catch (error: unknown) {
-          maybeDeleteEntry(entry);
-          return [toCopilotRuntimeError(error)];
-        }
-        return stopEntry(entry);
-      }
-      case "ready":
-        return stopReadyOrIdleEntry(entry, entry.state.client);
-      case "idle":
-        return stopReadyOrIdleEntry(entry, entry.state.client, entry.state.idleTimer);
-      case "stopping":
-        return entry.state.promise;
-      case "stopped":
-        return [];
-      default: {
-        const exhaustive: never = entry.state;
-        return exhaustive;
-      }
-    }
-  };
-
-  const scheduleIdleStop = (entry: PoolEntry, client: CopilotClient) => {
-    const idleTimer = setTimeout(() => {
-      void stopEntry(entry);
-    }, idleTtlMs);
-    entry.state = {
-      kind: "idle",
-      client,
-      idleTimer,
-    };
+    return entry.stopping;
   };
 
   const createEntry = (
@@ -172,10 +110,8 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}):
             throw error;
           }
         }
-        entry.state = { kind: "ready", client };
         return client;
       } catch (error: unknown) {
-        entry.state = { kind: "stopped" };
         maybeDeleteEntry(entry);
         throw toCopilotRuntimeError(error);
       }
@@ -183,14 +119,11 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}):
     const entry: PoolEntry = {
       key,
       cacheKey,
-      refCount: 1,
-      state: {
-        kind: "creating",
-        promise: createPromise,
-      },
+      refCount: 0,
+      client: createPromise,
     };
     entries.set(cacheKey, entry);
-    return { entry, createPromise };
+    return entry;
   };
 
   const acquire = async (
@@ -230,48 +163,24 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}):
     });
 
     while (true) {
-      if (disposed) {
+      if (disposePromise) {
         throw createDisposedError();
       }
 
-      const existing = entries.get(cacheKey);
-      if (!existing) {
-        const created = createEntry(key, cacheKey, clientOptions, runtimeArtifact);
-        const client = await created.createPromise;
-        if (disposed) {
-          await stopEntry(created.entry);
-          throw createDisposedError();
-        }
-        return toHandle(client);
+      const entry =
+        entries.get(cacheKey) ?? createEntry(key, cacheKey, clientOptions, runtimeArtifact);
+      if (entry.stopping) {
+        await entry.stopping;
+        continue;
       }
-
-      switch (existing.state.kind) {
-        case "creating": {
-          existing.refCount += 1;
-          const client = await existing.state.promise;
-          if (disposed) {
-            await stopEntry(existing);
-            throw createDisposedError();
-          }
-          return toHandle(client);
-        }
-        case "ready":
-          existing.refCount += 1;
-          return toHandle(existing.state.client);
-        case "idle": {
-          const client = existing.state.client;
-          clearTimeout(existing.state.idleTimer);
-          existing.refCount += 1;
-          existing.state = { kind: "ready", client };
-          return toHandle(client);
-        }
-        case "stopping":
-          await existing.state.promise;
-          continue;
-        case "stopped":
-          maybeDeleteEntry(existing);
-          continue;
+      clearTimeout(entry.idleTimer);
+      entry.refCount += 1;
+      const client = await entry.client;
+      if (disposePromise) {
+        await stopEntry(entry);
+        throw createDisposedError();
       }
+      return toHandle(client);
     }
   };
 
@@ -282,24 +191,7 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}):
     releasedHandles.add(handle);
 
     const entry = entries.get(JSON.stringify(handle.key));
-    if (!entry) {
-      return;
-    }
-
-    switch (entry.state.kind) {
-      case "creating":
-      case "stopping":
-      case "stopped":
-        return;
-      case "ready":
-      case "idle":
-        if (entry.state.client !== handle.client) {
-          return;
-        }
-        break;
-    }
-
-    if (entry.refCount <= 0) {
+    if (!entry || entry.stopping || (await entry.client) !== handle.client) {
       return;
     }
 
@@ -308,32 +200,25 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}):
       return;
     }
 
-    if (disposed) {
+    if (disposePromise) {
       await stopEntry(entry);
       return;
     }
 
-    if (entry.state.kind === "idle") {
-      clearTimeout(entry.state.idleTimer);
-    }
-    scheduleIdleStop(entry, entry.state.client);
+    entry.idleTimer = setTimeout(() => {
+      void stopEntry(entry);
+    }, idleTtlMs);
   };
 
   const dispose = async (): Promise<Error[]> => {
-    if (disposeCompleted) {
-      return [];
-    }
     if (disposePromise) {
       await disposePromise;
       return [];
     }
 
-    disposed = true;
     const snapshot = [...entries.values()];
     for (const entry of snapshot) {
-      if (entry.state.kind === "idle") {
-        clearTimeout(entry.state.idleTimer);
-      }
+      clearTimeout(entry.idleTimer);
     }
 
     disposePromise = (async () => {
@@ -343,15 +228,10 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}):
         errors.push(...stopErrors);
       }
       entries.clear();
-      disposeCompleted = true;
       return errors;
     })();
 
-    try {
-      return await disposePromise;
-    } finally {
-      disposePromise = undefined;
-    }
+    return await disposePromise;
   };
 
   return {

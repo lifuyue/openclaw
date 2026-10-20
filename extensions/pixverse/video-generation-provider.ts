@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { bufferToBlobPart } from "openclaw/plugin-sdk/blob-runtime";
 import { extensionForMime } from "openclaw/plugin-sdk/media-mime";
-import { isProviderApiKeyConfigured } from "openclaw/plugin-sdk/provider-auth";
+import { isProviderApiKeyConfiguredAsync } from "openclaw/plugin-sdk/provider-auth";
 import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
 import {
   assertOkOrThrowHttpError,
@@ -13,19 +13,18 @@ import {
   resolveProviderOperationTimeoutMs,
   resolveProviderHttpRequestConfig,
   sanitizeConfiguredModelProviderRequest,
-  type ProviderOperationDeadline,
 } from "openclaw/plugin-sdk/provider-http";
 import {
   asFiniteNumber,
   asSafeIntegerInRange,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
-import type {
-  GeneratedVideoAsset,
-  VideoGenerationModeCapabilities,
-  VideoGenerationProvider,
-  VideoGenerationRequest,
-  VideoGenerationSourceAsset,
+import {
+  normalizeVideoGenerationDuration,
+  type VideoGenerationModeCapabilities,
+  type VideoGenerationProvider,
+  type VideoGenerationRequest,
+  type VideoGenerationSourceAsset,
 } from "openclaw/plugin-sdk/video-generation";
 import {
   DEFAULT_PIXVERSE_MODEL_ID,
@@ -119,13 +118,6 @@ function resolvePixVerseQuality(req: VideoGenerationRequest): string {
     : DEFAULT_PIXVERSE_QUALITY;
 }
 
-function resolvePixVerseDurationSeconds(value: number | undefined): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return 5;
-  }
-  return Math.max(1, Math.min(MAX_DURATION_SECONDS, Math.round(value)));
-}
-
 function readPixVerseSeed(value: unknown): number | undefined {
   return asSafeIntegerInRange(value, { min: 0, max: PIXVERSE_SEED_MAX });
 }
@@ -191,53 +183,6 @@ function buildUploadImageForm(asset: VideoGenerationSourceAsset): FormData {
   return form;
 }
 
-function buildVideoBody(
-  req: VideoGenerationRequest,
-  model: string,
-  imageId?: number,
-): Record<string, unknown> {
-  const options = req.providerOptions ?? {};
-  const body: Record<string, unknown> = {
-    duration: resolvePixVerseDurationSeconds(req.durationSeconds),
-    model,
-    prompt: req.prompt,
-    quality: resolvePixVerseQuality(req),
-  };
-  if (imageId !== undefined) {
-    body.img_id = imageId;
-    body.motion_mode =
-      normalizeOptionalString(options.motion_mode) ??
-      normalizeOptionalString(options.motionMode) ??
-      "normal";
-  } else {
-    body.aspect_ratio = normalizeOptionalString(req.aspectRatio) ?? "16:9";
-  }
-  const negativePrompt =
-    normalizeOptionalString(options.negative_prompt) ??
-    normalizeOptionalString(options.negativePrompt);
-  if (negativePrompt) {
-    body.negative_prompt = negativePrompt;
-  }
-  const cameraMovement =
-    normalizeOptionalString(options.camera_movement) ??
-    normalizeOptionalString(options.cameraMovement);
-  if (cameraMovement) {
-    body.camera_movement = cameraMovement;
-  }
-  const templateId = asFiniteNumber(options.template_id) ?? asFiniteNumber(options.templateId);
-  if (templateId != null) {
-    body.template_id = templateId;
-  }
-  const seed = readPixVerseSeed(options.seed);
-  if (seed !== undefined) {
-    body.seed = seed;
-  }
-  if (req.audio !== undefined) {
-    body.generate_audio_switch = req.audio;
-  }
-  return body;
-}
-
 function readPixVerseFailureMessage(payload: PixVerseVideoResultResponse): string | undefined {
   switch (readPixVerseStatus(payload)) {
     case 7:
@@ -249,52 +194,6 @@ function readPixVerseFailureMessage(payload: PixVerseVideoResultResponse): strin
     default:
       return undefined;
   }
-}
-
-async function pollPixVerseVideo(params: {
-  videoId: number;
-  baseUrl: string;
-  deadline: ProviderOperationDeadline;
-  fetchFn: typeof fetch;
-  allowPrivateNetwork: boolean;
-  dispatcherPolicy?: Parameters<typeof postJsonRequest>[0]["dispatcherPolicy"];
-  headers: Headers;
-}): Promise<PixVerseVideoResultResponse> {
-  const readResult = (payload: PixVerseEnvelope<PixVerseVideoResultResponse>) =>
-    readPixVerseSuccess(payload, "PixVerse video status request failed");
-  const payload = await pollProviderOperationJson<PixVerseEnvelope<PixVerseVideoResultResponse>>({
-    url: `${params.baseUrl}/video/result/${params.videoId}`,
-    headers: () => buildPixVerseHeaders(params.headers),
-    deadline: params.deadline,
-    defaultTimeoutMs: DEFAULT_TIMEOUT_MS,
-    fetchFn: params.fetchFn,
-    maxAttempts: MAX_POLL_ATTEMPTS,
-    pollIntervalMs: POLL_INTERVAL_MS,
-    requestFailedMessage: "PixVerse video status request failed",
-    timeoutMessage: `PixVerse video generation task ${params.videoId} did not finish in time`,
-    isComplete: (candidate) => readPixVerseStatus(readResult(candidate)) === 1,
-    getFailureMessage: (candidate) => readPixVerseFailureMessage(readResult(candidate)),
-    allowPrivateNetwork: params.allowPrivateNetwork,
-    dispatcherPolicy: params.dispatcherPolicy,
-  });
-  return readResult(payload);
-}
-
-function extractPixVerseVideo(payload: PixVerseVideoResultResponse): GeneratedVideoAsset {
-  const url = normalizeOptionalString(payload.url);
-  if (!url) {
-    throw new Error("PixVerse video generation completed without output URL");
-  }
-  return {
-    url,
-    mimeType: "video/mp4",
-    fileName: "video-1.mp4",
-    metadata: {
-      sourceUrl: url,
-      outputWidth: asFiniteNumber(payload.outputWidth),
-      outputHeight: asFiniteNumber(payload.outputHeight),
-    },
-  };
 }
 
 function buildPixVerseModeCapabilities(imageToVideo = false): VideoGenerationModeCapabilities {
@@ -329,7 +228,8 @@ export function buildPixVerseVideoGenerationProvider(): VideoGenerationProvider 
     defaultModel: DEFAULT_PIXVERSE_MODEL_ID,
     defaultTimeoutMs: DEFAULT_TIMEOUT_MS,
     models: [...PIXVERSE_VIDEO_MODELS],
-    isConfigured: (ctx) => isProviderApiKeyConfigured({ provider: PIXVERSE_PROVIDER_ID, ...ctx }),
+    isConfiguredAsync: (ctx) =>
+      isProviderApiKeyConfiguredAsync({ provider: PIXVERSE_PROVIDER_ID, ...ctx }),
     capabilities: {
       generate: buildPixVerseModeCapabilities(),
       imageToVideo: {
@@ -408,11 +308,54 @@ export function buildPixVerseVideoGenerationProvider(): VideoGenerationProvider 
         }
       }
 
+      const options = req.providerOptions ?? {};
+      const body: Record<string, unknown> = {
+        duration: Math.min(
+          MAX_DURATION_SECONDS,
+          normalizeVideoGenerationDuration({ durationSeconds: req.durationSeconds }) ?? 5,
+        ),
+        model,
+        prompt: req.prompt,
+        quality: resolvePixVerseQuality(req),
+      };
+      if (imageId !== undefined) {
+        body.img_id = imageId;
+        body.motion_mode =
+          normalizeOptionalString(options.motion_mode) ??
+          normalizeOptionalString(options.motionMode) ??
+          "normal";
+      } else {
+        body.aspect_ratio = normalizeOptionalString(req.aspectRatio) ?? "16:9";
+      }
+      const negativePrompt =
+        normalizeOptionalString(options.negative_prompt) ??
+        normalizeOptionalString(options.negativePrompt);
+      if (negativePrompt) {
+        body.negative_prompt = negativePrompt;
+      }
+      const cameraMovement =
+        normalizeOptionalString(options.camera_movement) ??
+        normalizeOptionalString(options.cameraMovement);
+      if (cameraMovement) {
+        body.camera_movement = cameraMovement;
+      }
+      const templateId = asFiniteNumber(options.template_id) ?? asFiniteNumber(options.templateId);
+      if (templateId != null) {
+        body.template_id = templateId;
+      }
+      const seed = readPixVerseSeed(options.seed);
+      if (seed !== undefined) {
+        body.seed = seed;
+      }
+      if (req.audio !== undefined) {
+        body.generate_audio_switch = req.audio;
+      }
+
       const endpoint = imageId === undefined ? "/video/text/generate" : "/video/img/generate";
       const create = await postJsonRequest({
         url: `${baseUrl}${endpoint}`,
         headers: buildPixVerseHeaders(headers, "application/json"),
-        body: buildVideoBody(req, model, imageId),
+        body,
         timeoutMs: resolveProviderOperationTimeoutMs({
           deadline,
           defaultTimeoutMs: DEFAULT_TIMEOUT_MS,
@@ -431,17 +374,42 @@ export function buildPixVerseVideoGenerationProvider(): VideoGenerationProvider 
           submitted.video_id,
           "PixVerse video generation response missing video_id",
         );
-        const completed = await pollPixVerseVideo({
-          videoId,
-          baseUrl,
+        const readResult = (payload: PixVerseEnvelope<PixVerseVideoResultResponse>) =>
+          readPixVerseSuccess(payload, "PixVerse video status request failed");
+        const completedEnvelope = await pollProviderOperationJson<
+          PixVerseEnvelope<PixVerseVideoResultResponse>
+        >({
+          url: `${baseUrl}/video/result/${videoId}`,
+          headers: () => buildPixVerseHeaders(headers),
           deadline,
+          defaultTimeoutMs: DEFAULT_TIMEOUT_MS,
           fetchFn,
+          maxAttempts: MAX_POLL_ATTEMPTS,
+          pollIntervalMs: POLL_INTERVAL_MS,
+          requestFailedMessage: "PixVerse video status request failed",
+          timeoutMessage: `PixVerse video generation task ${videoId} did not finish in time`,
+          isComplete: (candidate) => readPixVerseStatus(readResult(candidate)) === 1,
+          getFailureMessage: (candidate) => readPixVerseFailureMessage(readResult(candidate)),
           allowPrivateNetwork,
           dispatcherPolicy,
-          headers,
         });
+        const completed = readResult(completedEnvelope);
+        const url = normalizeOptionalString(completed.url);
+        if (!url) {
+          throw new Error("PixVerse video generation completed without output URL");
+        }
+        const video = {
+          url,
+          mimeType: "video/mp4",
+          fileName: "video-1.mp4",
+          metadata: {
+            sourceUrl: url,
+            outputWidth: asFiniteNumber(completed.outputWidth),
+            outputHeight: asFiniteNumber(completed.outputHeight),
+          },
+        };
         return {
-          videos: [extractPixVerseVideo(completed)],
+          videos: [video],
           model,
           metadata: {
             endpoint,

@@ -329,7 +329,7 @@ export class AgentsApiClient {
         session.environment.type === "self_hosted" &&
         action.environment_id === session.environment.id
       ) {
-        // The operator's executor connects independently; keep the event stream open.
+        // The operator owns connecting the external executor.
         continue;
       }
       if (action.type !== "function_call") {

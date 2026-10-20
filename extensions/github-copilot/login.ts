@@ -1,10 +1,10 @@
 import {
-  resolveExpiresAtMsFromDurationMs,
   nonNegativeSecondsToSafeMilliseconds,
   positiveSecondsToSafeMilliseconds,
   resolveTimerTimeoutMs,
 } from "openclaw/plugin-sdk/number-runtime";
 import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
+import { sleepWithAbort } from "openclaw/plugin-sdk/retry-runtime";
 import { fetchWithSsrFGuard, type SsrFPolicy } from "openclaw/plugin-sdk/ssrf-runtime";
 import { normalizeGithubCopilotDomain, PUBLIC_GITHUB_COPILOT_DOMAIN } from "./domain.js";
 
@@ -28,7 +28,9 @@ type DeviceCodeResponse = {
   userCode: string;
   verificationUri: string;
   expiresInMs: number;
-  expiresAt: number;
+  // Monotonic performance.now() deadline; wall-clock jumps must not stretch or
+  // shrink the device-code window. Sleeps also consume setTimeout (monotonic).
+  deadlineMs: number;
   intervalMs: number;
 };
 
@@ -54,17 +56,14 @@ function parseJsonResponse(value: unknown): Record<string, unknown> {
 
 function parseDeviceCodeResponse(
   value: Record<string, unknown>,
-  issuedAt: number,
+  issuedAtMs: number,
 ): DeviceCodeResponse {
   const expiresInMs = positiveSecondsToSafeMilliseconds(value.expires_in);
   const intervalMs =
     value.interval === undefined
       ? GITHUB_DEVICE_FLOW_DEFAULT_INTERVAL_MS
       : nonNegativeSecondsToSafeMilliseconds(value.interval);
-  const expiresAt =
-    expiresInMs === undefined
-      ? undefined
-      : resolveExpiresAtMsFromDurationMs(expiresInMs, { nowMs: issuedAt });
+  const deadlineMs = expiresInMs === undefined ? undefined : issuedAtMs + expiresInMs;
 
   if (
     typeof value.device_code !== "string" ||
@@ -74,7 +73,7 @@ function parseDeviceCodeResponse(
     typeof value.verification_uri !== "string" ||
     !value.verification_uri ||
     expiresInMs === undefined ||
-    expiresAt === undefined ||
+    deadlineMs === undefined ||
     intervalMs === undefined
   ) {
     throw new Error("GitHub device code response missing fields");
@@ -85,7 +84,7 @@ function parseDeviceCodeResponse(
     userCode: value.user_code,
     verificationUri: value.verification_uri,
     expiresInMs,
-    expiresAt,
+    deadlineMs,
     intervalMs,
   };
 }
@@ -149,14 +148,16 @@ async function requestDeviceCode(params: {
     ...(params.assertCurrent ? { assertCurrent: params.assertCurrent } : {}),
   });
   params.assertCurrent?.();
-  // Anchor expiry to when GitHub issued the code, before UI prompts or browser launch.
-  return parseDeviceCodeResponse(json, Date.now());
+  // Anchor expiry to when GitHub issued the code, before UI prompts or browser
+  // launch, and keep the budget on the monotonic clock so wall-clock steps
+  // (NTP correction, sleep/resume, manual changes) cannot stretch or shrink it.
+  return parseDeviceCodeResponse(json, performance.now());
 }
 
 async function pollForAccessToken(params: {
   deviceCode: string;
   intervalMs: number;
-  expiresAt: number;
+  deadlineMs: number;
   domain: string;
   signal?: AbortSignal;
   assertCurrent?: () => void;
@@ -168,10 +169,10 @@ async function pollForAccessToken(params: {
   });
 
   let intervalMs = params.intervalMs;
-  while (Date.now() < params.expiresAt) {
-    await sleepGitHubDevicePollDelay(intervalMs, params.expiresAt, params.signal);
+  while (performance.now() < params.deadlineMs) {
+    await sleepGitHubDevicePollDelay(intervalMs, params.deadlineMs, params.signal);
     params.assertCurrent?.();
-    if (Date.now() >= params.expiresAt) {
+    if (performance.now() >= params.deadlineMs) {
       break;
     }
 
@@ -217,30 +218,17 @@ async function pollForAccessToken(params: {
 
 async function sleepGitHubDevicePollDelay(
   delayMs: number,
-  expiresAt: number,
+  deadlineMs: number,
   signal?: AbortSignal,
 ): Promise<void> {
   const requestedDelayMs = Math.max(1, Math.floor(delayMs));
-  const targetAt = Math.min(Date.now() + requestedDelayMs, expiresAt);
-  while (Date.now() < targetAt) {
-    const remainingMs = Math.max(1, targetAt - Date.now());
+  const targetAt = Math.min(performance.now() + requestedDelayMs, deadlineMs);
+  while (performance.now() < targetAt) {
+    const remainingMs = Math.max(1, targetAt - performance.now());
     const safeDelayMs = resolveTimerTimeoutMs(remainingMs, 1);
     const waitMs = Math.min(safeDelayMs, remainingMs);
-    await new Promise<void>((resolve, reject) => {
-      const onAbort = () => {
-        clearTimeout(timeout);
-        reject(
-          signal?.reason instanceof Error ? signal.reason : new Error("GitHub login cancelled"),
-        );
-      };
-      const timeout = setTimeout(() => {
-        signal?.removeEventListener("abort", onAbort);
-        resolve();
-      }, waitMs);
-      signal?.addEventListener("abort", onAbort, { once: true });
-      if (signal?.aborted) {
-        onAbort();
-      }
+    await sleepWithAbort(waitMs, signal).catch(() => {
+      throw signal?.reason instanceof Error ? signal.reason : new Error("GitHub login cancelled");
     });
   }
 }
@@ -320,7 +308,7 @@ export async function runGitHubCopilotDeviceFlow(
   return await pollForAccessToken({
     deviceCode: device.deviceCode,
     intervalMs: Math.max(1000, device.intervalMs),
-    expiresAt: device.expiresAt,
+    deadlineMs: device.deadlineMs,
     domain: host,
     ...(io.signal ? { signal: io.signal } : {}),
     assertCurrent,

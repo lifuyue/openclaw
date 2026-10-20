@@ -5,8 +5,6 @@ import { detectPackageManager } from "./detect-package-manager.js";
 import { readPackageManagerSpec } from "./package-json.js";
 import { applyPathPrepend } from "./path-prepend.js";
 
-// Update package-manager resolution chooses the package manager for update
-// builds and can bootstrap pnpm when a managed checkout requires it.
 type BuildManager = "pnpm" | "bun" | "npm";
 
 export function resolvePnpmCandidateEnv(
@@ -39,7 +37,6 @@ type ResolvedBuildManager =
   | {
       kind: "resolved";
       manager: BuildManager;
-      preferred: BuildManager;
       fallback: boolean;
       env?: NodeJS.ProcessEnv;
       cleanup?: () => Promise<void>;
@@ -65,92 +62,10 @@ async function isManagerAvailable(
   }
 }
 
-function cloneCommandEnv(env?: NodeJS.ProcessEnv): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(env ?? process.env)
-      .filter(([, value]) => value != null)
-      .map(([key, value]) => [key, String(value)]),
-  ) as Record<string, string>;
-}
-
-async function enablePnpmViaCorepack(
-  runCommand: PackageManagerCommandRunner,
-  timeoutMs: number,
-  env?: NodeJS.ProcessEnv,
-  expectedVersion?: string,
-  work?: { timeoutMs?: number },
-): Promise<"enabled" | "missing" | "failed"> {
-  if (!(await isManagerAvailable(runCommand, "corepack", timeoutMs, env))) {
-    return "missing";
-  }
-  try {
-    const res = await runCommand(["corepack", "enable"], {
-      timeoutMs: work ? work.timeoutMs : timeoutMs,
-      env,
-    });
-    if (res.code !== 0) {
-      return "failed";
-    }
-  } catch {
-    return "failed";
-  }
-  return (await isManagerAvailable(runCommand, "pnpm", timeoutMs, env, expectedVersion))
-    ? "enabled"
-    : "failed";
-}
-
-async function bootstrapPnpmViaNpm(params: {
-  version: string;
-  runCommand: PackageManagerCommandRunner;
-  timeoutMs: number;
-  work?: { timeoutMs?: number };
-  baseEnv?: NodeJS.ProcessEnv;
-}): Promise<{ env: NodeJS.ProcessEnv; cleanup: () => Promise<void> } | null> {
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-pnpm-"));
-  const cleanup = async () => {
-    await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
-  };
-  try {
-    // npm 11.16+ requires project policy for local installs; only this pinned
-    // tool may run its native-binary provisioning script in the temporary prefix.
-    await fs.writeFile(
-      path.join(tempRoot, "package.json"),
-      JSON.stringify({
-        private: true,
-        allowScripts: { [`pnpm@${params.version}`]: true },
-      }),
-    );
-    const installResult = await params.runCommand(
-      ["npm", "install", "--prefix", tempRoot, `pnpm@${params.version}`],
-      {
-        timeoutMs: params.work ? params.work.timeoutMs : params.timeoutMs,
-        env: params.baseEnv,
-      },
-    );
-    if (installResult.code !== 0) {
-      await cleanup();
-      return null;
-    }
-    const env = cloneCommandEnv(params.baseEnv);
-    applyPathPrepend(env, [path.join(tempRoot, "node_modules", ".bin")]);
-    if (
-      !(await isManagerAvailable(params.runCommand, "pnpm", params.timeoutMs, env, params.version))
-    ) {
-      await cleanup();
-      return null;
-    }
-    return { env, cleanup };
-  } catch {
-    await cleanup();
-    return null;
-  }
-}
-
 export function parsePnpmPackageManagerVersion(pin: string | null): string | undefined {
   return /^pnpm@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+.*)?$/u.exec(pin ?? "")?.[1];
 }
 
-/** Resolve the package manager and environment to use for an update build. */
 export async function resolveUpdateBuildManager(
   commandRunner: PackageManagerCommandRunner,
   root: string,
@@ -166,34 +81,77 @@ export async function resolveUpdateBuildManager(
   const pnpmVersion = parsePnpmPackageManagerVersion(pin);
   if (preferred === "pnpm") {
     if (await isManagerAvailable(runCommand, "pnpm", timeoutMs, baseEnv, pnpmVersion)) {
-      return { kind: "resolved", manager: "pnpm", preferred, fallback: false };
+      return { kind: "resolved", manager: "pnpm", fallback: false };
     }
 
-    const corepackStatus = await enablePnpmViaCorepack(
-      runCommand,
-      timeoutMs,
-      baseEnv,
-      pnpmVersion,
-      work,
-    );
+    const corepackStatus = await (async () => {
+      if (!(await isManagerAvailable(runCommand, "corepack", timeoutMs, baseEnv))) {
+        return "missing";
+      }
+      try {
+        const res = await runCommand(["corepack", "enable"], {
+          timeoutMs: work ? work.timeoutMs : timeoutMs,
+          env: baseEnv,
+        });
+        if (res.code !== 0) {
+          return "failed";
+        }
+      } catch {
+        return "failed";
+      }
+      return (await isManagerAvailable(runCommand, "pnpm", timeoutMs, baseEnv, pnpmVersion))
+        ? "enabled"
+        : "failed";
+    })();
     if (corepackStatus === "enabled") {
-      return { kind: "resolved", manager: "pnpm", preferred, fallback: false };
+      return { kind: "resolved", manager: "pnpm", fallback: false };
     }
 
     const npmAvailable = await isManagerAvailable(runCommand, "npm", timeoutMs, baseEnv);
     if (npmAvailable && pnpmVersion) {
-      const pnpmBootstrap = await bootstrapPnpmViaNpm({
-        version: pnpmVersion,
-        runCommand,
-        timeoutMs,
-        work,
-        baseEnv,
-      });
+      const pnpmBootstrap = await (async () => {
+        const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-pnpm-"));
+        const cleanup = async () => {
+          await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+        };
+        try {
+          // npm 11.16+ requires project policy for local installs; only this pinned
+          // tool may run its native-binary provisioning script in the temporary prefix.
+          await fs.writeFile(
+            path.join(tempRoot, "package.json"),
+            JSON.stringify({
+              private: true,
+              allowScripts: { [`pnpm@${pnpmVersion}`]: true },
+            }),
+          );
+          const installResult = await runCommand(
+            ["npm", "install", "--prefix", tempRoot, `pnpm@${pnpmVersion}`],
+            { timeoutMs: work ? work.timeoutMs : timeoutMs, env: baseEnv },
+          );
+          if (installResult.code !== 0) {
+            await cleanup();
+            return null;
+          }
+          const env = Object.fromEntries(
+            Object.entries(baseEnv ?? process.env)
+              .filter(([, value]) => value != null)
+              .map(([key, value]) => [key, String(value)]),
+          );
+          applyPathPrepend(env, [path.join(tempRoot, "node_modules", ".bin")]);
+          if (!(await isManagerAvailable(runCommand, "pnpm", timeoutMs, env, pnpmVersion))) {
+            await cleanup();
+            return null;
+          }
+          return { env, cleanup };
+        } catch {
+          await cleanup();
+          return null;
+        }
+      })();
       if (pnpmBootstrap) {
         return {
           kind: "resolved",
           manager: "pnpm",
-          preferred,
           fallback: false,
           env: pnpmBootstrap.env,
           cleanup: pnpmBootstrap.cleanup,
@@ -220,36 +178,9 @@ export async function resolveUpdateBuildManager(
         manager === "pnpm" ? pnpmVersion : undefined,
       )
     ) {
-      return { kind: "resolved", manager, preferred, fallback: manager !== preferred };
+      return { kind: "resolved", manager, fallback: manager !== preferred };
     }
   }
 
   return { kind: "missing-required", preferred, reason: "preferred-manager-unavailable" };
-}
-
-/** Build argv for running a package-manager script. */
-export function managerScriptArgs(manager: BuildManager, script: string, args: string[] = []) {
-  if (manager === "pnpm") {
-    return ["pnpm", script, ...args];
-  }
-  if (manager === "bun") {
-    return ["bun", "run", script, ...args];
-  }
-  if (args.length > 0) {
-    return ["npm", "run", script, "--", ...args];
-  }
-  return ["npm", "run", script];
-}
-
-/** Build argv for installing dependencies with a package manager. */
-export function managerInstallArgs(manager: BuildManager, opts?: { compatFallback?: boolean }) {
-  if (manager === "npm" && opts?.compatFallback) {
-    return ["npm", "install", "--no-package-lock", "--legacy-peer-deps"];
-  }
-  return [manager, "install"];
-}
-
-/** Build argv for installing dependencies while skipping lifecycle scripts. */
-export function managerInstallIgnoreScriptsArgs(manager: BuildManager): string[] {
-  return [manager, "install", "--ignore-scripts"];
 }

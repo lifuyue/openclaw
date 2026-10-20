@@ -14,29 +14,23 @@ import {
 } from "@openclaw/media-core/mime";
 import { hasHttpUrlPrefix } from "@openclaw/net-policy/url-protocol";
 import { uniqueValues } from "@openclaw/normalization-core/string-normalization";
-import type { EncodedImage } from "rastermill";
 import { resolveCanvasHttpPathToLocalPath } from "../canvas/documents.js";
-import { logVerbose, shouldLogVerbose } from "../globals.js";
+import { logVerbose } from "../globals.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { FsSafeError } from "../infra/fs-safe.js";
-import {
-  executeSqliteQuerySync,
-  executeSqliteQueryTakeFirstSync,
-  getNodeSqliteKysely,
-} from "../infra/kysely-sync.js";
 import type { PinnedDispatcherPolicy, SsrFPolicy } from "../infra/net/ssrf.js";
-import { isNotFoundPathError, isPathInside } from "../infra/path-guards.js";
+import { isPathInside } from "../infra/path-guards.js";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
-import { getPluginRegistryForContext } from "../plugins/runtime/gateway-request-scope.js";
-import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
-import {
-  openOpenClawStateDatabase,
-  runOpenClawStateWriteTransaction,
-} from "../state/openclaw-state-db.js";
+import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
+import type { OpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.types.js";
 import { resolveUserPath } from "../utils.js";
-import { chunkItems } from "../utils/chunk-items.js";
 import { readOutboundMediaFile } from "./bounded-read-file.js";
 import { readRemoteMediaBuffer } from "./fetch.js";
+import {
+  pruneGeneratedHtmlProvenance,
+  readGeneratedHtmlProvenance,
+  writeGeneratedHtmlProvenance,
+} from "./generated-html-provenance.js";
 import { ImageOptimizationLimitError } from "./image-optimization-error.js";
 import { MAX_IMAGE_INPUT_PIXELS } from "./image-processor-config.js";
 import { createImageProcessorWithPixelLimits } from "./image-processor.js";
@@ -122,25 +116,6 @@ async function resolveMediaStoreUriToPath(mediaUrl: string): Promise<string | nu
     }
     throw err;
   }
-}
-
-async function resolveHostedPluginMediaUrl(mediaUrl: string): Promise<string | null> {
-  const registry = getPluginRegistryForContext();
-  for (const entry of registry?.hostedMediaResolvers ?? []) {
-    try {
-      const resolved = await entry.resolver(mediaUrl);
-      if (typeof resolved === "string" && resolved.trim()) {
-        return resolved;
-      }
-    } catch (err) {
-      if (shouldLogVerbose()) {
-        logVerbose(
-          `Hosted media resolver failed (${entry.pluginId ?? "unknown"}): ${formatErrorMessage(err)}`,
-        );
-      }
-    }
-  }
-  return null;
 }
 
 function resolveWebMediaOptions(params: {
@@ -291,26 +266,16 @@ type HostReadHtmlTrust =
   | { source: "temp-root" }
   | { source: "outbound"; expectedSha256: string; expectedSize: number };
 
-const TRUSTED_GENERATED_HTML_MARKER_VERSION = 1;
-const TRUSTED_GENERATED_HTML_MARKER_KIND = "trusted-generated-html";
-type OutboundProvenanceDatabase = Pick<OpenClawStateKyselyDatabase, "outbound_media_provenance">;
-
 async function getTrustedGeneratedHtmlMarker(
   resolvedFilePath: string,
+  context: OpenClawStateWorkerContext,
 ): Promise<{ sha256: string; size: number } | undefined> {
   try {
-    const { db } = openOpenClawStateDatabase();
-    const row = executeSqliteQueryTakeFirstSync(
-      db,
-      getNodeSqliteKysely<OutboundProvenanceDatabase>(db)
-        .selectFrom("outbound_media_provenance")
-        .select(["kind", "version", "sha256", "size_bytes"])
-        .where("realpath", "=", resolvedFilePath),
-    );
-    return row?.kind === TRUSTED_GENERATED_HTML_MARKER_KIND &&
-      row.version === TRUSTED_GENERATED_HTML_MARKER_VERSION
-      ? { sha256: row.sha256, size: row.size_bytes }
-      : undefined;
+    const reply = await readGeneratedHtmlProvenance(context, {
+      type: "generatedHtmlProvenance.read",
+      input: resolvedFilePath,
+    });
+    return reply?.type === "generatedHtmlProvenance.read" ? reply.marker : undefined;
   } catch (error) {
     // State failures must narrow trust, never turn into a permissive fallback.
     logVerbose(
@@ -326,6 +291,14 @@ async function resolveTrustedGeneratedHostReadHtml(
   if (!filePath) {
     return undefined;
   }
+  let context: OpenClawStateWorkerContext | undefined;
+  try {
+    context = captureOpenClawStateWorkerContext();
+  } catch (error) {
+    // Refused storage narrows outbound trust without changing the temp-root contract.
+    logVerbose(`trusted-html admission failed: ${formatErrorMessage(error)}`);
+  }
+  const outboundPath = path.join(getMediaDir(), "outbound");
   const info = await lstat(filePath).catch(() => undefined);
   if (!info?.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
     return undefined;
@@ -333,7 +306,7 @@ async function resolveTrustedGeneratedHostReadHtml(
   const [resolvedFilePath, tmpRoot, outboundRoot] = await Promise.all([
     realpath(filePath).catch(() => undefined),
     realpath(resolvePreferredOpenClawTmpDir()).catch(() => undefined),
-    realpath(path.join(getMediaDir(), "outbound")).catch(() => undefined),
+    realpath(outboundPath).catch(() => undefined),
   ]);
   if (!resolvedFilePath) {
     return undefined;
@@ -341,7 +314,9 @@ async function resolveTrustedGeneratedHostReadHtml(
   // Outbound staging always requires provenance, even when a custom state dir
   // places media/outbound underneath the otherwise trusted temp root.
   if (outboundRoot && isPathInside(outboundRoot, resolvedFilePath)) {
-    const marker = await getTrustedGeneratedHtmlMarker(resolvedFilePath);
+    const marker = context
+      ? await getTrustedGeneratedHtmlMarker(resolvedFilePath, context)
+      : undefined;
     return marker
       ? { source: "outbound", expectedSha256: marker.sha256, expectedSize: marker.size }
       : undefined;
@@ -354,84 +329,33 @@ export async function markTrustedGeneratedHtmlPath(
   filePath: string,
   contents: Buffer,
 ): Promise<void> {
+  const context = captureOpenClawStateWorkerContext();
+  const outboundPath = path.join(getMediaDir(), "outbound");
+  const sha256 = createHash("sha256").update(contents).digest("hex");
+  const sizeBytes = contents.length;
   const resolvedFilePath = await realpath(filePath);
-  const outboundRoot = await realpath(path.join(getMediaDir(), "outbound")).catch(() => undefined);
+  const outboundRoot = await realpath(outboundPath).catch(() => undefined);
   if (!outboundRoot || !isPathInside(outboundRoot, resolvedFilePath)) {
     throw new Error(
       `markTrustedGeneratedHtmlPath: refusing path outside outbound staging: ${resolvedFilePath}`,
     );
   }
-  const sha256 = createHash("sha256").update(contents).digest("hex");
-  const sizeBytes = contents.length;
-  const createdAtMs = Date.now();
-  runOpenClawStateWriteTransaction(({ db }) => {
-    executeSqliteQuerySync(
-      db,
-      getNodeSqliteKysely<OutboundProvenanceDatabase>(db)
-        .insertInto("outbound_media_provenance")
-        .values({
-          realpath: resolvedFilePath,
-          kind: TRUSTED_GENERATED_HTML_MARKER_KIND,
-          version: TRUSTED_GENERATED_HTML_MARKER_VERSION,
-          sha256,
-          size_bytes: sizeBytes,
-          created_at_ms: createdAtMs,
-        })
-        .onConflict((conflict) =>
-          conflict.column("realpath").doUpdateSet({
-            kind: TRUSTED_GENERATED_HTML_MARKER_KIND,
-            version: TRUSTED_GENERATED_HTML_MARKER_VERSION,
-            sha256,
-            size_bytes: sizeBytes,
-            created_at_ms: createdAtMs,
-          }),
-        ),
-    );
+  await writeGeneratedHtmlProvenance(context, {
+    type: "generatedHtmlProvenance.upsert",
+    input: {
+      realpath: resolvedFilePath,
+      kind: "trusted-generated-html",
+      version: 1,
+      sha256,
+      size_bytes: sizeBytes,
+      created_at_ms: Date.now(),
+    },
   });
 }
 
 /** Removes provenance whose staged regular file no longer exists. */
 export async function pruneStaleTrustedGeneratedHtmlMarkers(): Promise<void> {
-  const { db } = openOpenClawStateDatabase();
-  const rows = executeSqliteQuerySync(
-    db,
-    getNodeSqliteKysely<OutboundProvenanceDatabase>(db)
-      .selectFrom("outbound_media_provenance")
-      .select("realpath"),
-  ).rows;
-  const stale: string[] = [];
-  for (const row of rows) {
-    let info: Awaited<ReturnType<typeof lstat>>;
-    try {
-      info = await lstat(row.realpath);
-    } catch (error) {
-      if (isNotFoundPathError(error)) {
-        stale.push(row.realpath);
-      } else {
-        logVerbose(
-          `trusted-html prune kept uninspectable marker (${row.realpath}): ${formatErrorMessage(error)}`,
-        );
-      }
-      continue;
-    }
-    if (!info?.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
-      stale.push(row.realpath);
-    }
-  }
-  if (stale.length === 0) {
-    return;
-  }
-  runOpenClawStateWriteTransaction(({ db: writeDb }) => {
-    for (const batch of chunkItems(stale, 500)) {
-      executeSqliteQuerySync(
-        writeDb,
-        getNodeSqliteKysely<OutboundProvenanceDatabase>(writeDb)
-          .deleteFrom("outbound_media_provenance")
-          .where("realpath", "in", batch),
-      );
-    }
-  });
-  logVerbose(`trusted-html prune removed ${stale.length} stale marker(s)`);
+  await pruneGeneratedHtmlProvenance(captureOpenClawStateWorkerContext());
 }
 
 function isTrustedGeneratedHostReadHtml(params: {
@@ -571,8 +495,6 @@ function toImageFileName(fileName: string | undefined, mimeType: string): string
     : path.format({ dir: parsed.dir, name: parsed.name || trimmed, ext });
 }
 
-const DEFAULT_JPEG_SIDES = [2048, 1536, 1280, 1024, 800] as const;
-const DEFAULT_JPEG_QUALITIES = [80, 70, 60, 50, 40] as const;
 const DEFAULT_VISION_MAX_SIDE = 2048;
 const LOW_IMAGE_SIDE_FALLBACKS = [640, 512, 384, 256, 192, 128] as const;
 
@@ -644,25 +566,20 @@ function imageSatisfiesHardDimensionPolicy(
   metadata?: ImageMetadata,
 ): boolean {
   const models = policy?.models ?? [];
-  const hardMaxSides = models
-    .map((model) => positiveInteger(model.maxSidePx))
-    .filter((value): value is number => value !== undefined);
-  const hardMaxPixels = models
-    .map((model) => positiveInteger(model.maxPixels))
-    .filter((value): value is number => value !== undefined);
-  if (hardMaxSides.length === 0 && hardMaxPixels.length === 0) {
+  const hardMaxSide = Math.min(
+    ...models.map((model) => positiveInteger(model.maxSidePx) ?? Infinity),
+  );
+  const hardMaxPixels = Math.min(
+    ...models.map((model) => positiveInteger(model.maxPixels) ?? Infinity),
+  );
+  if (hardMaxSide === Infinity && hardMaxPixels === Infinity) {
     return true;
   }
-
   const meta = metadata ?? readImageMetadataFromHeader(buffer);
-  if (!meta) {
-    return false;
-  }
-  const maxSide = Math.max(meta.width, meta.height);
-  const pixels = meta.width * meta.height;
-  return (
-    (hardMaxSides.length === 0 || maxSide <= Math.min(...hardMaxSides)) &&
-    (hardMaxPixels.length === 0 || pixels <= Math.min(...hardMaxPixels))
+  return Boolean(
+    meta &&
+    Math.max(meta.width, meta.height) <= hardMaxSide &&
+    meta.width * meta.height <= hardMaxPixels,
   );
 }
 
@@ -676,41 +593,6 @@ function assertImageSatisfiesHardDimensionPolicy(
   const meta = readImageMetadataFromHeader(buffer);
   const detail = meta ? `: ${meta.width}x${meta.height}` : "";
   throw new Error(`Image dimensions exceed model image limits${detail}`);
-}
-
-function resolvePreservableOriginalImageContentType(params: {
-  buffer: Buffer;
-  cap: number;
-  contentType?: string;
-  policy?: ImageCompressionPolicy;
-}): string | null {
-  if (params.buffer.length > params.cap) {
-    return null;
-  }
-  const declaredContentType = normalizeMimeType(params.contentType);
-  const probe = readImageProbeFromHeader(params.buffer);
-  const actualContentType = probe ? `image/${probe.format}` : undefined;
-  if (!probe || !isPreservableImageMime(actualContentType)) {
-    return null;
-  }
-  const declaredPreservableContentType = isPreservableImageMime(declaredContentType)
-    ? declaredContentType
-    : undefined;
-  if (declaredPreservableContentType && declaredPreservableContentType !== actualContentType) {
-    return null;
-  }
-  if (declaredContentType?.startsWith("image/") && !declaredPreservableContentType) {
-    return null;
-  }
-  const preferredSide =
-    resolveImageCompressionGrid(params.policy).sides[0] ?? DEFAULT_VISION_MAX_SIDE;
-  if (
-    Math.max(probe.width, probe.height) > preferredSide ||
-    !imageSatisfiesHardDimensionPolicy(params.buffer, params.policy, probe)
-  ) {
-    return null;
-  }
-  return declaredPreservableContentType ?? actualContentType;
 }
 
 function isPreservableImageMime(
@@ -751,76 +633,25 @@ function buildDescendingLadder(maxSide: number, values: readonly number[]): numb
   return uniqueValues(fallbackLadder.filter((value) => value > 0)).toSorted((a, b) => b - a);
 }
 
+const IMAGE_COMPRESSION_GRIDS = {
+  efficient: { sides: [1024, 800], qualities: [70, 60, 50, 40] },
+  high: {
+    sides: [3072, 2576, 2048, 1800, 1536, 1280, 1024, 800],
+    qualities: [92, 85, 78, 70, 62, 52, 42],
+  },
+  balanced: { sides: [2048, 1536, 1280, 1024, 800], qualities: [80, 70, 60, 50, 40] },
+} as const;
+
 function resolveImageCompressionGrid(policy?: ImageCompressionPolicy): {
   sides: number[];
   qualities: number[];
 } {
   const preference = effectiveImageQualityPreference(policy);
-  const side = sideForPreference(preference, policy);
-  switch (preference) {
-    case "efficient":
-      return {
-        sides: buildDescendingLadder(side, [1024, 800]),
-        qualities: [70, 60, 50, 40],
-      };
-    case "high":
-      return {
-        sides: buildDescendingLadder(side, [3072, 2576, 2048, 1800, 1536, 1280, 1024, 800]),
-        qualities: [92, 85, 78, 70, 62, 52, 42],
-      };
-    default:
-      return {
-        sides: buildDescendingLadder(side, [...DEFAULT_JPEG_SIDES]),
-        qualities: [...DEFAULT_JPEG_QUALITIES],
-      };
-  }
-}
-
-function logOptimizedImage(originalSize: number, optimized: EncodedImage): void {
-  if (!shouldLogVerbose() || optimized.bytes >= originalSize) {
-    return;
-  }
-  const resizeSide = optimized.chosen.maxSide ?? Math.max(optimized.width, optimized.height);
-  if (optimized.format === "png") {
-    logVerbose(
-      `Optimized PNG (preserving alpha) from ${formatMediaSize(originalSize)} to ${formatMediaSize(optimized.bytes)} (side<=${resizeSide}px)`,
-    );
-    return;
-  }
-  logVerbose(
-    `Optimized media from ${formatMediaSize(originalSize)} to ${formatMediaSize(optimized.bytes)} (side<=${resizeSide}px, q=${optimized.chosen.quality})`,
-  );
-}
-
-async function optimizeImageWithFallback(params: {
-  buffer: Buffer;
-  cap: number;
-  imageCompression?: ImageCompressionPolicy;
-  maxInputPixels?: number;
-}): Promise<EncodedImage> {
-  const { buffer, cap } = params;
-  const grid = resolveImageCompressionGrid(params.imageCompression);
-  // Generic callers keep the shared decode limit. An owner with a bounded downscale path may
-  // widen source admission explicitly, while every encoded result remains under the output cap.
-  const processor = createImageProcessorWithPixelLimits({
-    inputPixels: params.maxInputPixels ?? MAX_IMAGE_INPUT_PIXELS,
-    outputPixels: MAX_IMAGE_INPUT_PIXELS,
-  });
-  const optimized = await processor.encode(buffer, {
-    format: "auto",
-    maxBytes: cap,
-    opaque: { format: "jpeg" },
-    transparent: { format: "png" },
-    search: {
-      maxSide: grid.sides,
-      quality: grid.qualities,
-    },
-    transparency: "auto",
-  });
-  if (optimized.chosen.transparency === "flattened" && shouldLogVerbose()) {
-    logVerbose(`Image transparency flattened to fit ${formatMediaSize(cap)} optimization budget`);
-  }
-  return optimized;
+  const grid = IMAGE_COMPRESSION_GRIDS[preference];
+  return {
+    sides: buildDescendingLadder(sideForPreference(preference, policy), grid.sides),
+    qualities: [...grid.qualities],
+  };
 }
 
 /** Optimizes image bytes for web-media delivery while preserving accepted original formats when possible. */
@@ -843,12 +674,35 @@ export async function optimizeImageBufferForWebMedia(params: {
     }
     assertImageSatisfiesHardDimensionPolicy(params.buffer, params.imageCompression);
   } else {
-    originalContentType = resolvePreservableOriginalImageContentType({
-      buffer: params.buffer,
-      cap,
-      contentType: params.contentType,
-      policy: params.imageCompression,
-    });
+    originalContentType = (() => {
+      const { buffer, contentType, imageCompression: policy } = params;
+      if (buffer.length > cap) {
+        return null;
+      }
+      const declaredContentType = normalizeMimeType(contentType);
+      const probe = readImageProbeFromHeader(buffer);
+      const actualContentType = probe ? `image/${probe.format}` : undefined;
+      if (!probe || !isPreservableImageMime(actualContentType)) {
+        return null;
+      }
+      const declaredPreservableContentType = isPreservableImageMime(declaredContentType)
+        ? declaredContentType
+        : undefined;
+      if (declaredPreservableContentType && declaredPreservableContentType !== actualContentType) {
+        return null;
+      }
+      if (declaredContentType?.startsWith("image/") && !declaredPreservableContentType) {
+        return null;
+      }
+      const preferredSide = resolveImageCompressionGrid(policy).sides[0] ?? DEFAULT_VISION_MAX_SIDE;
+      if (
+        Math.max(probe.width, probe.height) > preferredSide ||
+        !imageSatisfiesHardDimensionPolicy(buffer, policy, probe)
+      ) {
+        return null;
+      }
+      return declaredPreservableContentType ?? actualContentType;
+    })();
   }
   if (originalContentType) {
     return {
@@ -858,13 +712,21 @@ export async function optimizeImageBufferForWebMedia(params: {
       fileName: params.fileName,
     };
   }
-  const optimized = await optimizeImageWithFallback({
-    buffer: params.buffer,
-    cap,
-    imageCompression: params.imageCompression,
-    ...(params.maxInputPixels === undefined ? {} : { maxInputPixels: params.maxInputPixels }),
+  const grid = resolveImageCompressionGrid(params.imageCompression);
+  // Generic callers keep the shared decode limit. An owner with a bounded downscale path may
+  // widen source admission explicitly, while every encoded result remains under the output cap.
+  const processor = createImageProcessorWithPixelLimits({
+    inputPixels: params.maxInputPixels ?? MAX_IMAGE_INPUT_PIXELS,
+    outputPixels: MAX_IMAGE_INPUT_PIXELS,
   });
-  logOptimizedImage(params.buffer.length, optimized);
+  const optimized = await processor.encode(params.buffer, {
+    format: "auto",
+    maxBytes: cap,
+    opaque: { format: "jpeg" },
+    transparent: { format: "png" },
+    search: { maxSide: grid.sides, quality: grid.qualities },
+    transparency: "auto",
+  });
   if (optimized.data.length > cap) {
     throw new ImageOptimizationLimitError(
       formatCapReduce("Media", cap, optimized.data.length),
@@ -910,10 +772,7 @@ async function loadWebMediaInternal(
       throw new LocalMediaAccessError("invalid-file-url", (err as Error).message, { cause: err });
     }
   }
-  mediaUrl =
-    resolveCanvasHttpPathToLocalPath(mediaUrl) ??
-    (await resolveHostedPluginMediaUrl(mediaUrl)) ??
-    mediaUrl;
+  mediaUrl = resolveCanvasHttpPathToLocalPath(mediaUrl) ?? mediaUrl;
   mediaUrl = stripLegacyMediaDirectivePrefix(mediaUrl);
 
   const clampAndFinalize = async (params: WebMediaResult): Promise<WebMediaResult> => {

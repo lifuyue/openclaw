@@ -2,10 +2,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { MediaUnderstandingModelConfig } from "../config/types.tools.js";
 import { resolveExecutableFromPathEnv } from "../infra/executable-path.js";
+import { pathExists } from "../infra/fs-safe.js";
 import { resolveEnvironmentValue } from "../infra/process-env.js";
 import { runExec } from "../process/exec.js";
 import { getOrCreatePromise } from "../shared/lazy-promise.js";
-import { optionalPathExists } from "./fs.js";
 
 type LocalAudioCandidate = {
   id: "parakeet-mlx" | "whisper-cli" | "sherpa-onnx-offline" | "whisper";
@@ -29,11 +29,11 @@ type LocalAudioSelection = {
 };
 
 type InspectionOptions = {
+  language?: string;
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   arch?: string;
   resolveBinary?: (name: string, env: NodeJS.ProcessEnv) => Promise<string | null>;
-  resolveRealpath?: (filePath: string) => Promise<string>;
   inspectLinkedLibraries?: (filePath: string, platform: NodeJS.Platform) => Promise<string | null>;
   listDirectory?: (dirPath: string) => Promise<string[]>;
 };
@@ -182,7 +182,6 @@ async function inspectWhisperBackend(params: {
   command: string;
   platform: NodeJS.Platform;
   arch: string;
-  realpath: (filePath: string) => Promise<string>;
   libraries: (filePath: string, platform: NodeJS.Platform) => Promise<string | null>;
 }): Promise<Pick<LocalAudioCandidate, "capableBackend" | "evidence">> {
   const libraries = await params.libraries(params.command, params.platform);
@@ -193,7 +192,7 @@ async function inspectWhisperBackend(params: {
     };
   }
   if (params.platform === "darwin" && params.arch === "arm64") {
-    const realCommand = await params.realpath(params.command).catch(() => params.command);
+    const realCommand = await fs.realpath(params.command).catch(() => params.command);
     if (
       /(?:ggml[-_]?metal|Metal\.framework)/i.test(libraries ?? "") ||
       /\/Cellar\/whisper-cpp\/[^/]+\/bin\/whisper-cli$/.test(realCommand)
@@ -246,7 +245,7 @@ export async function inspectLocalAudioSelection(
   const envModel = env.WHISPER_CPP_MODEL?.trim();
   const whisperModel =
     whisperCommand !== null
-      ? envModel && (await optionalPathExists(envModel))
+      ? envModel && (await pathExists(envModel))
         ? envModel
         : await discoverWhisperCppModel(options.listDirectory ?? listDirectoryEntries)
       : null;
@@ -256,7 +255,6 @@ export async function inspectLocalAudioSelection(
         command: whisperCommand,
         platform,
         arch,
-        realpath: options.resolveRealpath ?? fs.realpath,
         libraries: options.inspectLinkedLibraries ?? inspectLinkedLibraries,
       })
     : {
@@ -272,7 +270,7 @@ export async function inspectLocalAudioSelection(
   const sherpaReady =
     sherpaCommand !== null &&
     sherpaFiles.length === 4 &&
-    (await Promise.all(sherpaFiles.map(optionalPathExists))).every(Boolean);
+    (await Promise.all(sherpaFiles.map((file) => pathExists(file)))).every(Boolean);
   const parakeetReady = parakeetCommand !== null && platform === "darwin" && arch === "arm64";
   const parakeetArgs = [
     "{{AttachmentPath}}",
@@ -309,6 +307,7 @@ export async function inspectLocalAudioSelection(
     "{{OutputDir}}",
     "--verbose",
     "False",
+    ...(options.language ? ["--language", "{{Language}}"] : []),
     "{{AttachmentPath}}",
   ];
 

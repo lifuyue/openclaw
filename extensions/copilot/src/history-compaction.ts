@@ -1,36 +1,19 @@
-import type { CopilotClient } from "@github/copilot-sdk";
+import type { CopilotClient, CopilotSession, SessionConfig } from "@github/copilot-sdk";
 import {
   buildAgentHookContextChannelFields,
   type AgentHarnessCompactParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import type { CopilotSessionConfig } from "./attempt-types.js";
 import { createCopilotAbortError } from "./prompt-error.js";
 
-export interface CopilotHistoryCompactResult {
-  success: boolean;
-  tokensRemoved: number;
-  messagesRemoved: number;
-  summaryContent?: string;
-  contextWindow?: {
-    tokenLimit: number;
-    currentTokens: number;
-    messagesLength: number;
-    systemTokens?: number;
-    conversationTokens?: number;
-    toolDefinitionsTokens?: number;
-  };
-}
+export type CopilotHistoryCompactResult = Awaited<
+  ReturnType<CopilotSession["rpc"]["history"]["compact"]>
+>;
 
-export interface CopilotHistoryCompactSession {
-  abort(): Promise<void>;
-  disconnect(): Promise<void>;
+export type CopilotHistoryCompactSession = Pick<CopilotSession, "abort" | "disconnect"> & {
   rpc: {
-    history: {
-      abortManualCompaction(): Promise<{ aborted: boolean }>;
-      compact(params?: { customInstructions?: string }): Promise<CopilotHistoryCompactResult>;
-    };
+    history: Pick<CopilotSession["rpc"]["history"], "abortManualCompaction" | "compact">;
   };
-}
+};
 
 export function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
@@ -66,7 +49,7 @@ export async function compactTrackedSdkSession(params: {
   customInstructions?: string;
   gitHubToken?: string;
   onSession?: (session: CopilotHistoryCompactSession) => void;
-  sessionConfig: CopilotSessionConfig;
+  sessionConfig: SessionConfig;
   sdkSessionId: string;
 }): Promise<CopilotHistoryCompactResult> {
   params.assertCurrent();

@@ -47,6 +47,77 @@ describe("statusSummaryRuntime configured model normalization", () => {
     expect(normalizeProviderModelIdWithRuntimeMock).not.toHaveBeenCalled();
   });
 
+  it("resolves agent-local aliases without model normalization", async () => {
+    const { statusSummaryRuntime } = await import("../status/summary.runtime.js");
+    const cases: Array<{
+      name: string;
+      defaults: Record<string, { alias?: string }>;
+      models: Record<string, { alias?: string }>;
+      primary?: string;
+      expected: { provider: string; model: string };
+    }> = [
+      {
+        name: "agent-only alias",
+        defaults: {},
+        models: { "anthropic/fixture-local": { alias: "fast" } },
+        primary: "fast",
+        expected: { provider: "anthropic", model: "fixture-local" },
+      },
+      {
+        name: "agent alias shadows the global alias",
+        defaults: { "openai/fixture-global": { alias: "fast" } },
+        models: { "anthropic/fixture-local": { alias: "fast" } },
+        primary: "fast",
+        expected: { provider: "anthropic", model: "fixture-local" },
+      },
+      {
+        name: "inherited primary uses the agent alias",
+        defaults: { "openai/fixture-global": { alias: "fast" } },
+        models: { "anthropic/fixture-local": { alias: "fast" } },
+        expected: { provider: "anthropic", model: "fixture-local" },
+      },
+      {
+        name: "empty agent alias clears the inherited alias",
+        defaults: { "openai/fixture-global": { alias: "fast" } },
+        models: { "openai/fixture-global": { alias: "" } },
+        expected: { provider: "openai", model: "fast" },
+      },
+      {
+        name: "omitted agent alias keeps the inherited alias",
+        defaults: { "openai/fixture-global": { alias: "fast" } },
+        models: { "openai/fixture-global": {} },
+        expected: { provider: "openai", model: "fixture-global" },
+      },
+      {
+        name: "agent alias matching ignores case and whitespace",
+        defaults: {},
+        models: { "anthropic/fixture-local": { alias: " fast " } },
+        primary: "  FAST  ",
+        expected: { provider: "anthropic", model: "fixture-local" },
+      },
+    ];
+    for (const { name, defaults, models, primary, expected } of cases) {
+      const cfg: OpenClawConfig = {
+        agents: {
+          defaults: { model: "fast", models: defaults },
+          entries: { work: { ...(primary ? { model: primary } : {}), models } },
+        },
+      };
+
+      expect(
+        statusSummaryRuntime.resolveConfiguredStatusModelRef({
+          cfg,
+          agentId: "work",
+          defaultProvider: "openai",
+          defaultModel: "fixture-fallback",
+        }),
+        name,
+      ).toEqual(expected);
+    }
+    expect(resolveManifestModelIdNormalizationPoliciesMock).not.toHaveBeenCalled();
+    expect(normalizeProviderModelIdWithRuntimeMock).not.toHaveBeenCalled();
+  });
+
   it("skips manifest and plugin model normalization for providerless persisted session models", async () => {
     const { statusSummaryRuntime } = await import("../status/summary.runtime.js");
     const configured = { provider: "anthropic", model: "claude-sonnet-4-6" };
@@ -74,4 +145,41 @@ describe("statusSummaryRuntime configured model normalization", () => {
     expect(resolveManifestModelIdNormalizationPoliciesMock).not.toHaveBeenCalled();
     expect(normalizeProviderModelIdWithRuntimeMock).not.toHaveBeenCalled();
   });
+
+  it.each([
+    {
+      name: "explicit provider override",
+      entry: { providerOverride: "openai", modelOverride: "gpt-5.5", model: "opus-4.6" },
+      expected: { provider: "openai", model: "gpt-5.5" },
+    },
+    {
+      name: "qualified model override",
+      entry: { modelOverride: "openai/gpt-5.5", model: "opus-4.6" },
+      expected: { provider: "openai", model: "gpt-5.5" },
+    },
+    {
+      name: "providerless model override preserves its stored spelling",
+      entry: { modelOverride: "opus-4.6", modelProvider: "openai", model: "gpt-5.5" },
+      expected: { provider: "anthropic", model: "opus-4.6" },
+    },
+    {
+      name: "empty override falls back to the stored model",
+      entry: { providerOverride: "openai", modelOverride: "  ", model: "opus-4.6" },
+      expected: { provider: "anthropic", model: "opus-4.6" },
+    },
+  ])(
+    "resolves session selection before display normalization: $name",
+    async ({ entry, expected }) => {
+      const { statusSummaryRuntime } = await import("../status/summary.runtime.js");
+
+      expect(
+        statusSummaryRuntime.resolveSessionModelRef(
+          { provider: "anthropic", model: "claude-sonnet-4-6" },
+          entry,
+        ),
+      ).toEqual(expected);
+      expect(resolveManifestModelIdNormalizationPoliciesMock).not.toHaveBeenCalled();
+      expect(normalizeProviderModelIdWithRuntimeMock).not.toHaveBeenCalled();
+    },
+  );
 });

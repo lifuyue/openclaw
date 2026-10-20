@@ -26,8 +26,9 @@ import { formatDeliveryQueueHealthLine, formatHealthChannelLines } from "./healt
 import type { HealthSummary } from "./health.js";
 import { formatSqliteWalHealthWarning } from "./sqlite-wal-health.js";
 import type { AgentLocalStatus } from "./status.agent-local.js";
-import { formatPromptCacheCompact, formatTokensCompact, shortenText } from "./status.format.js";
+import { formatPromptCacheCompact, formatTokensCompact } from "./status.format.js";
 import type { MemoryStatusSnapshot } from "./status.scan.shared.js";
+import { shortenText } from "./text-format.js";
 
 type AgentStatusLike = {
   defaultId?: string | null;
@@ -118,6 +119,16 @@ export function buildStatusMemoryValue(params: {
     const slot = params.memoryPlugin.slot ? `plugin ${params.memoryPlugin.slot}` : "plugin";
     return theme.muted(`enabled (${slot}) · ${params.memoryUnavailableLabel ?? "unavailable"}`);
   }
+  if ("health" in params.memory) {
+    const detail = params.memory.health.message ? ` · ${params.memory.health.message}` : "";
+    const status =
+      params.memory.health.status === "ready"
+        ? theme.success("ready")
+        : params.memory.health.status === "degraded"
+          ? theme.warn("degraded")
+          : theme.warn("unavailable");
+    return `plugin ${params.memory.provider} · ${status}${detail}`;
+  }
   const parts: string[] = [];
   const dirtySuffix = params.memory.dirty ? ` · ${theme.warn("dirty")}` : "";
   parts.push(`${params.memory.files} files · ${params.memory.chunks} chunks${dirtySuffix}`);
@@ -201,7 +212,7 @@ export function buildStatusSecurityAuditLines(params: {
     }
   }
   lines.push(theme.muted(`Full report: ${formatCliCommand("openclaw security audit")}`));
-  lines.push(theme.muted(`Deep probe: ${formatCliCommand("openclaw security audit --deep")}`));
+  lines.push(theme.muted(`Deep check: ${formatCliCommand("openclaw security audit --deep")}`));
   return lines;
 }
 
@@ -296,11 +307,8 @@ export function buildStatusSessionsRows(params: {
 }
 
 /** Explains sessions pinned to a selected model different from the current configured default. */
-export function buildStatusModelSelectionLines(params: {
-  recent: SessionsRecentLike[];
-  limit?: number;
-}) {
-  const mismatches = params.recent.filter((sess) => {
+export function buildStatusModelSelectionLines(recent: SessionsRecentLike[]) {
+  const mismatches = recent.filter((sess) => {
     if (!sess.configuredModel || !sess.selectedModel || !sess.modelSelectionReason) {
       return false;
     }
@@ -314,9 +322,8 @@ export function buildStatusModelSelectionLines(params: {
     return [];
   }
 
-  const limit = params.limit ?? 3;
   const lines: string[] = [];
-  for (const sess of mismatches.slice(0, limit)) {
+  for (const sess of mismatches.slice(0, 3)) {
     const key = shortenText(sess.key, 48);
     const configured = sess.configuredModel ?? "unknown";
     const selected = sess.selectedModel ?? "unknown";
@@ -337,8 +344,8 @@ export function buildStatusModelSelectionLines(params: {
       "  Docs: https://docs.openclaw.ai/concepts/models#selection-source-and-fallback-strictness",
     );
   }
-  if (mismatches.length > limit) {
-    lines.push(theme.muted(`  … +${mismatches.length - limit} more pinned session(s)`));
+  if (mismatches.length > 3) {
+    lines.push(theme.muted(`  … +${mismatches.length - 3} more pinned session(s)`));
   }
   return lines;
 }
@@ -366,22 +373,16 @@ export function buildStatusFooterLines(params: {
   ];
 }
 
-export function buildStatusPluginCompatibilityLines(params: {
-  notices: PluginCompatibilityNotice[];
-  limit?: number;
-}) {
-  if (params.notices.length === 0) {
+export function buildStatusPluginCompatibilityLines(notices: PluginCompatibilityNotice[]) {
+  if (notices.length === 0) {
     return [];
   }
-  const limit = params.limit ?? 8;
   return [
-    ...params.notices.slice(0, limit).map((notice) => {
+    ...notices.slice(0, 8).map((notice) => {
       const label = notice.severity === "warn" ? theme.warn("WARN") : theme.muted("INFO");
       return `  ${label} ${formatPluginCompatibilityNotice(notice)}`;
     }),
-    ...(params.notices.length > limit
-      ? [theme.muted(`  … +${params.notices.length - limit} more`)]
-      : []),
+    ...(notices.length > 8 ? [theme.muted(`  … +${notices.length - 8} more`)] : []),
   ];
 }
 
@@ -415,23 +416,15 @@ export function buildStatusPairingRecoveryLines(params: {
   ];
 }
 
-export function buildStatusSystemEventsRows(params: {
-  queuedSystemEvents: string[];
-  limit?: number;
-}) {
-  const limit = params.limit ?? 5;
-  if (params.queuedSystemEvents.length === 0) {
+export function buildStatusSystemEventsRows(queuedSystemEvents: string[]) {
+  if (queuedSystemEvents.length === 0) {
     return undefined;
   }
-  return params.queuedSystemEvents.slice(0, limit).map((event) => ({ Event: event }));
+  return queuedSystemEvents.slice(0, 5).map((event) => ({ Event: event }));
 }
 
-export function buildStatusSystemEventsTrailer(params: {
-  queuedSystemEvents: string[];
-  limit?: number;
-}) {
-  const limit = params.limit ?? 5;
-  return params.queuedSystemEvents.length > limit
-    ? theme.muted(`… +${params.queuedSystemEvents.length - limit} more`)
+export function buildStatusSystemEventsTrailer(queuedSystemEvents: string[]) {
+  return queuedSystemEvents.length > 5
+    ? theme.muted(`… +${queuedSystemEvents.length - 5} more`)
     : null;
 }

@@ -1,5 +1,6 @@
 import { redactSensitiveUrlLikeString } from "@openclaw/net-policy/redact-sensitive-url";
 import { GatewayProtocolRequestTimeoutError } from "../../packages/gateway-client/src/protocol-request.js";
+import { readMissingScopeError } from "../../packages/gateway-protocol/src/gateway-error-details.js";
 import { note } from "../../packages/terminal-core/src/note.js";
 import { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text.js";
 import { formatCliCommand } from "../cli/command-format.js";
@@ -24,15 +25,12 @@ import {
 } from "../gateway/call.js";
 import { isGatewaySecretRefUnavailableError } from "../gateway/credentials.js";
 import { isLoopbackGatewayUrl } from "../gateway/net.js";
-import type {
-  DoctorMemoryEmbeddingRuntimePayload,
-  DoctorMemoryStatusPayload,
-} from "../gateway/server-methods/doctor.js";
+import type { DoctorMemoryStatusPayload } from "../gateway/server-methods/doctor.js";
 import { collectChannelStatusIssues } from "../infra/channels-status-issues.js";
 import { formatMissingChildRuntimeWarning } from "../infra/child-runtime-viability.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { formatDurationSeconds } from "../infra/format-time/format-duration.js";
-import { readGatewayLastInstallationReplacement } from "../infra/gateway-boot-lifecycle.js";
+import { readGatewayLastInstallationReplacementAsync } from "../infra/gateway-boot-lifecycle.js";
 import type { RuntimeEnv } from "../runtime.js";
 import type { StatusSummary } from "../status/summary.js";
 import { VERSION } from "../version.js";
@@ -57,15 +55,27 @@ function formatGatewayHealthDiagnostic(value: unknown): string {
   return scrubDoctorErrorMessage(sanitizeTerminalText(redactSensitiveUrlLikeString(raw)));
 }
 
-function readLocalInstallationReplacement(
+async function readLocalInstallationReplacement(
   cfg: OpenClawConfig,
   env?: NodeJS.ProcessEnv,
-): string | undefined {
-  const replacement =
-    cfg.gateway?.mode === "remote" ? undefined : readGatewayLastInstallationReplacement(env);
-  return replacement
-    ? `Previous installation replacement (${new Date(replacement.completedAtMs).toISOString()}): ${formatGatewayHealthDiagnostic(replacement.reason)}`
-    : undefined;
+): Promise<Pick<HealthFinding, "severity" | "message"> | undefined> {
+  if (cfg.gateway?.mode === "remote") {
+    return undefined;
+  }
+  try {
+    const replacement = await readGatewayLastInstallationReplacementAsync(env);
+    return replacement
+      ? {
+          severity: "info",
+          message: `Previous installation replacement (${new Date(replacement.completedAtMs).toISOString()}): ${formatGatewayHealthDiagnostic(replacement.reason)}`,
+        }
+      : undefined;
+  } catch (error) {
+    return {
+      severity: "warning",
+      message: `Previous installation replacement unavailable: ${formatGatewayHealthDiagnostic(error)}`,
+    };
+  }
 }
 
 export async function collectGatewayHealthFindings(
@@ -73,13 +83,12 @@ export async function collectGatewayHealthFindings(
 ): Promise<readonly HealthFinding[]> {
   const mode = ctx.cfg.gateway?.mode === "remote" ? "remote" : "local";
   const gatewayPath = mode === "remote" ? "gateway.remote.url" : "gateway.mode";
-  const replacement = readLocalInstallationReplacement(ctx.cfg, ctx.env);
+  const replacement = await readLocalInstallationReplacement(ctx.cfg, ctx.env);
   const historyFindings: HealthFinding[] = replacement
     ? [
         {
           checkId: "core/doctor/gateway-health",
-          severity: "info",
-          message: replacement,
+          ...replacement,
           path: "gateway.mode",
         },
       ]
@@ -164,7 +173,7 @@ export async function collectGatewayHealthFindings(
           message: GATEWAY_HEALTH_RATE_LIMITED_MESSAGE,
           fixHint: "Wait for the temporary authentication lockout to expire, then rerun doctor.",
         }
-      : isGatewayCredentialsRequiredError(error) || isGatewaySecretRefUnavailableError(error)
+      : isGatewayHealthAuthUnavailableError(error)
         ? {
             message:
               "Gateway status could not be inspected because this CLI has no usable token/password or paired device token for read-scope RPCs.",
@@ -181,20 +190,6 @@ export async function collectGatewayHealthFindings(
     return [...historyFindings, warning(diagnostic.message, diagnostic.fixHint)];
   }
 }
-
-type GatewayMemoryProbe = {
-  checked: boolean;
-  ready: boolean;
-  error?: string;
-  runtimeFacts?: DoctorMemoryEmbeddingRuntimePayload;
-  /**
-   * True when the probe was intentionally skipped by the gateway (probe: false
-   * path). Distinct from checked: false caused by a network timeout or
-   * unavailable gateway. Renderers should suppress warnings only for skipped
-   * probes, not for transport failures.
-   */
-  skipped: boolean;
-};
 
 function isGatewayCallTimeout(message: string): boolean {
   return /^gateway timeout after \d+ms(?:\n|$)/.test(message);
@@ -214,7 +209,11 @@ function resolveGatewayDiagnosticsTimeouts(timeoutMs: number, statusElapsedMs: n
 }
 
 function isGatewayHealthAuthUnavailableError(error: unknown): boolean {
-  return isGatewayCredentialsRequiredError(error) || isGatewaySecretRefUnavailableError(error);
+  return (
+    isGatewayCredentialsRequiredError(error) ||
+    isGatewaySecretRefUnavailableError(error) ||
+    readMissingScopeError(error) !== null
+  );
 }
 
 function noteCliGatewayVersionSkew(status: StatusSummary | undefined): void {
@@ -287,9 +286,9 @@ export async function checkGatewayHealth(params: {
   cfg: OpenClawConfig;
   timeoutMs?: number;
 }): Promise<{ healthOk: boolean; authenticated: boolean; status?: StatusSummary }> {
-  const replacement = readLocalInstallationReplacement(params.cfg);
+  const replacement = await readLocalInstallationReplacement(params.cfg);
   if (replacement) {
-    note(replacement, "Previous Gateway installation replacement");
+    note(replacement.message, "Previous Gateway installation replacement");
   }
   const { bindAgentToolGatewayRequest } = await import("../agents/tools/in-process-gateway.js");
   const requestGateway = bindAgentToolGatewayRequest({ hostedOnly: true });
@@ -317,6 +316,7 @@ export async function checkGatewayHealth(params: {
       method: "status",
       params: { includeChannelSummary: false },
       timeoutMs: remainingMs,
+      sharedStateMode: "read-only",
       config: params.cfg,
       onHelloOk: ({ snapshot }: GatewayHello) => {
         gatewaySnapshot = snapshot;
@@ -332,25 +332,22 @@ export async function checkGatewayHealth(params: {
       `Gateway answered status in ${formatDurationSeconds(statusElapsedMs)}; ${diagnostic} diagnostics did not finish within ${formatDurationSeconds(diagnosticsTimeoutMs)}. The host may be slow; this does not mark the Gateway unhealthy.`;
     healthOk = true;
     noteCliGatewayVersionSkew(status);
-    if (status.startupMigrationWarning) {
-      note(sanitizeTerminalText(status.startupMigrationWarning), "Startup migration warnings");
-    }
+    const noteWarning = (warning: string | undefined, title: string) => {
+      if (warning) {
+        note(sanitizeTerminalText(warning), title);
+      }
+    };
+    noteWarning(status.startupMigrationWarning, "Startup migration warnings");
     const sqliteWalWarning = formatSqliteWalHealthWarning(status.sqliteWal);
     if (sqliteWalWarning) {
       note(sqliteWalWarning, "SQLite WAL");
     }
-    if (status.startupRecoveryWarning) {
-      note(sanitizeTerminalText(status.startupRecoveryWarning), "Startup session recovery");
-    }
+    noteWarning(status.startupRecoveryWarning, "Startup session recovery");
     const childRuntimeWarning = status.childRuntime
       ? formatMissingChildRuntimeWarning(status.childRuntime)
       : undefined;
-    if (childRuntimeWarning) {
-      note(sanitizeTerminalText(childRuntimeWarning), "Gateway runtime");
-    }
-    if (status.installationReplacementWarning) {
-      note(sanitizeTerminalText(status.installationReplacementWarning), "Installation replaced");
-    }
+    noteWarning(childRuntimeWarning, "Gateway runtime");
+    noteWarning(status.installationReplacementWarning, "Installation replaced");
     const secretDegradations = projectDoctorSecretRuntimeDegradations(status);
     if (secretDegradations.length > 0) {
       note(
@@ -376,12 +373,14 @@ export async function checkGatewayHealth(params: {
         method: "channels.status",
         params: { probe: true, timeoutMs: channelProbeTimeoutMs },
         timeoutMs: diagnosticsTimeoutMs,
+        sharedStateMode: "read-only",
         config: params.cfg,
       }),
       requestGateway({
         method: "diagnostics.stability",
         params: { type: "telemetry.exporter", limit: 1000 },
         timeoutMs: diagnosticsTimeoutMs,
+        sharedStateMode: "read-only",
         config: params.cfg,
       }),
     ]);
@@ -405,7 +404,7 @@ export async function checkGatewayHealth(params: {
         [
           isGatewayCallTimeout(formatErrorMessage(channelsResult.reason))
             ? slowDiagnosticNote("channel")
-            : `Channel status probe failed: ${sanitizeTerminalText(formatErrorMessage(channelsResult.reason))}`,
+            : `Channel status check failed: ${sanitizeTerminalText(formatErrorMessage(channelsResult.reason))}`,
           `Retry: ${formatCliCommand("openclaw channels status --probe")}`,
         ].join("\n"),
         "Channel warnings",
@@ -473,6 +472,15 @@ export async function checkGatewayHealth(params: {
   return { healthOk, authenticated: false, status };
 }
 
+/** Doctor callers also create skipped probes without diagnostic fields. */
+type GatewayMemoryProbe = {
+  checked: boolean;
+  ready: boolean;
+  error?: string;
+  runtimeFacts?: DoctorMemoryStatusPayload["embeddingRuntime"];
+  skipped: boolean;
+};
+
 /** Probes gateway memory readiness without forcing deep embedding checks. */
 export async function probeGatewayMemoryStatus(params: {
   cfg: OpenClawConfig;
@@ -487,8 +495,20 @@ export async function probeGatewayMemoryStatus(params: {
       method: "doctor.memory.status",
       params: { probe: false },
       timeoutMs,
+      sharedStateMode: "read-only",
       config: params.cfg,
     });
+    if (payload.health) {
+      return {
+        checked: true,
+        ready: payload.health.status === "ready",
+        error:
+          payload.health.status === "ready"
+            ? undefined
+            : (payload.health.message ?? `memory provider health is ${payload.health.status}`),
+        skipped: false,
+      };
+    }
     // An intentional shallow skip must not look like an embedding-readiness failure.
     const gatewayChecked = payload.embedding.checked !== false;
     return {
@@ -504,7 +524,7 @@ export async function probeGatewayMemoryStatus(params: {
     return {
       checked: !timedOut,
       ready: false,
-      error: `gateway memory probe ${timedOut ? "timed out" : "unavailable"}: ${message}`,
+      error: `gateway memory check ${timedOut ? "timed out" : "unavailable"}: ${message}`,
       skipped: false,
     };
   }
