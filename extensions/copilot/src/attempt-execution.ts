@@ -103,7 +103,6 @@ export async function runCopilotExecution(context: {
   // session created under this journal can be deleted after incomplete cleanup.
   let nativeSessionCreatedFresh = false;
   let nativeSessionHistoryValidated = false;
-  let disconnectError: Error | undefined;
   let handle: PooledClient | undefined;
   let session: SessionLike | undefined;
   let bridge: ReturnType<typeof attachEventBridge> | undefined;
@@ -338,7 +337,6 @@ export async function runCopilotExecution(context: {
       hookContext,
       modelRef,
       messages,
-      operation: deps.operation,
       poolAcquire,
       ringZeroSystemAgentRun,
       promptToolPolicy,
@@ -620,9 +618,8 @@ export async function runCopilotExecution(context: {
         try {
           await session.disconnect();
         } catch (error: unknown) {
-          disconnectError = toCopilotError(error);
           if (!promptError && !timedOut) {
-            promptError = disconnectError;
+            promptError = toCopilotError(error);
           }
         }
       }

@@ -1,13 +1,4 @@
-import {
-  For,
-  Show,
-  createMemo,
-  createUniqueId,
-  createSignal,
-  onSettled,
-  mapArray,
-  onCleanup,
-} from "solid-js";
+import { For, Show, createMemo, createUniqueId, createSignal, onSettled, mapArray } from "solid-js";
 import { beginNativeWindowDrag } from "../../../app/native-window-drag.ts";
 import { readPanelHostedTabs, type PanelHostedTab } from "../../../components/panel-hosted-tabs.ts";
 import {
@@ -23,9 +14,11 @@ import { Icon, type IconName } from "../../../components/solid/icon.tsx";
 import { AgentIdentityAvatar } from "../../../components/solid/identity-avatar.tsx";
 import { KeyboardShortcut } from "../../../components/solid/kbd.tsx";
 import { Menu, type MenuItem } from "../../../components/solid/menu.tsx";
+import { createTextOverflow } from "../../../components/solid/text-overflow.ts";
 import "../../../components/tooltip.ts";
 import { formatUiError } from "../../../lib/format-error.ts";
 import type { AgentIdentity } from "../../../lib/identity-avatar-view.ts";
+import { elementRef } from "../../../lib/reactive/element-ref.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
 import type { TabFocus } from "../../../lib/tabs.ts";
 import { showToast } from "../../../lib/toast.ts";
@@ -99,7 +92,13 @@ export function PanelTypeOption(props: { type: SidebarPanelDefinition }) {
       <span class="side-panel-type-option__icon" aria-hidden="true">
         <Icon name={props.type.icon} />
       </span>
-      <span class="side-panel-type-option__label">{props.type.label}</span>{" "}
+      <span
+        ref={createTextOverflow(() => props.type.label)}
+        class="side-panel-type-option__label"
+        title={props.type.label}
+      >
+        {props.type.label}
+      </span>{" "}
       <Show when={props.type.shortcut}>
         {(shortcut) => (
           <KeyboardShortcut combo={shortcut()} class="side-panel-type-option__shortcut" />
@@ -216,6 +215,15 @@ function TypeMenu(props: SidebarRegionHeaderProps) {
           class: "side-panel-type-menu__item session-menu__item",
           icon: <Icon name={current().icon} class="side-panel-type-option__icon" />,
           labelClass: "side-panel-type-option__label",
+          content: (
+            <span
+              ref={createTextOverflow(() => current().label)}
+              style="display:block;overflow:hidden"
+              title={current().label}
+            >
+              {current().label}
+            </span>
+          ),
           details: (
             <Show when={current().shortcut}>
               {(shortcut) => (
@@ -279,7 +287,6 @@ function HostedIcon(props: SidebarRegionHeaderProps & { tab: PanelHostedTab }) {
 }
 
 export function SidebarRegionHeader(props: SidebarRegionHeaderProps) {
-  onCleanup(() => props.headerRef(null));
   const desktop = () => props.presentation === "desktop";
   const [closing, setClosing] = createSignal(false);
   const state = createMemo(() => {
@@ -544,7 +551,12 @@ export function SidebarRegionHeader(props: SidebarRegionHeaderProps) {
   });
   return (
     <header
-      ref={props.headerRef}
+      ref={[
+        elementRef<HTMLElement>((element) => {
+          props.headerRef(element);
+          return () => props.headerRef(null);
+        }),
+      ]}
       class={[
         "rail-header side-panel__header",
         { "side-panel__header--occupied": state().tabs.length > 0 },

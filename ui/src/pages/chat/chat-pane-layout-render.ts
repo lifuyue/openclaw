@@ -10,8 +10,6 @@ import { storedChatOutboxScopeKey } from "../../lib/chat/outbox-store.ts";
 import { scopedAgentParamsForSession } from "../../lib/sessions/index.ts";
 import { resolveUiConversationIdentity } from "../../lib/sessions/session-key.ts";
 import { resolveSessionWorkspace } from "../../lib/sessions/workspace.ts";
-import { clawCreatorFlow } from "../claws/creator-flow.ts";
-import { canCreateClawDraft } from "../claws/draft-navigation.ts";
 import { PaneOutboxRecovery } from "./chat-outbox-recovery.tsx";
 import { PaneAttachmentCatalog } from "./chat-pane-attachment-catalog.ts";
 import { sidebarPanelDefinitions } from "./chat-pane-embedded-panels.ts";
@@ -506,10 +504,6 @@ export abstract class ChatPaneLayoutRender extends ChatPaneHeaderLayout {
         ),
       connected: state.connected,
       onClearCompanion: this.clearSessionCompanion,
-      onCreateClaw:
-        currentAgentId && canCreateClawDraft(this.context)
-          ? () => void clawCreatorFlow(this.context).start(currentAgentId)
-          : undefined,
       discussion,
       discussionAvailable,
       discussionOpenUrl: discussion?.openUrl ?? null,
@@ -617,31 +611,32 @@ export abstract class ChatPaneLayoutRender extends ChatPaneHeaderLayout {
       : nativeCallbacks;
     // Main panel actions share the task toolbar. Content roots stay in the
     // sidebar region so changing their presentation never reconnects them.
-    const header =
+    const paneHeader =
       subagentHeader || this.compact
         ? null
-        : {
-            header: this.renderPaneHeader(
-              headerWorkspace,
-              selectedSession,
-              catalog,
-              agentWorkspace,
-              workspaceGit,
-              chatProps.placementStartup,
-              mobileHost ? sidebarLayout : savedLayout,
-              panelDefinitions,
-              subagentStopInNotice ? undefined : subagentStop,
-              headerDetails,
-              { openPanelSlot: callbacks.openSlot, closePanelSlot: callbacks.closeSlot },
-            ),
-            notice:
-              !conversationVisible && chatProps.error
-                ? { error: chatProps.error, onDismissError: chatProps.onDismissError }
-                : undefined,
-            sessionKey: state.sessionKey,
-            agentId: currentAgentId,
-            presentation: headerPresentation,
-          };
+        : this.renderPaneHeader(
+            headerWorkspace,
+            selectedSession,
+            catalog,
+            agentWorkspace,
+            workspaceGit,
+            chatProps.placementStartup,
+            mobileHost ? sidebarLayout : savedLayout,
+            panelDefinitions,
+            subagentStopInNotice ? undefined : subagentStop,
+            headerDetails,
+            { openPanelSlot: callbacks.openSlot, closePanelSlot: callbacks.closeSlot },
+          );
+    const header = paneHeader && {
+      header: paneHeader,
+      notice:
+        !conversationVisible && chatProps.error
+          ? { error: chatProps.error, onDismissError: chatProps.onDismissError }
+          : undefined,
+      sessionKey: state.sessionKey,
+      agentId: currentAgentId,
+      presentation: headerPresentation,
+    };
     const externalPanelsToggle = this.sessionPresentation === "desktop" && header !== null;
     if (header) {
       this.configureHeaderPanelPresentation({
