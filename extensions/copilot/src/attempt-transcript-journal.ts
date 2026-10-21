@@ -10,7 +10,7 @@ import {
   appendSessionTranscriptMessageByIdentityStrict,
   appendSessionTranscriptMessagesByIdentity,
   publishSessionTranscriptUpdateByIdentity,
-  readVisibleSessionTranscriptMessageEntries,
+  withSessionTranscriptWrite,
   type SessionTranscriptTargetParams,
   type TranscriptEntryAnchor,
 } from "openclaw/plugin-sdk/session-transcript-runtime";
@@ -305,16 +305,22 @@ export function createAttemptTranscriptJournal(params: {
     assertMemoryOwnerCurrent();
     const writes = [group.assistant, ...group.order.map((id) => group.results.get(id)!)];
     const keys = writes.map((write) => readIdempotencyKey(write.message));
-    const persistedKeys = new Set(
+    const persistedKeys =
       owner.kind === "memory"
-        ? owner.manager.getEntries().flatMap((entry) => {
-            const key = entry.type === "message" ? readIdempotencyKey(entry.message) : undefined;
-            return key ? [key] : [];
-          })
-        : (await readVisibleSessionTranscriptMessageEntries(owner.target)).flatMap((entry) =>
-            entry.idempotencyKey ? [entry.idempotencyKey] : [],
-          ),
-    );
+        ? new Set(
+            owner.manager.getEntries().flatMap((entry) => {
+              const key = entry.type === "message" ? readIdempotencyKey(entry.message) : undefined;
+              return key ? [key] : [];
+            }),
+          )
+        : (
+            await withSessionTranscriptWrite(owner.target, (transcript) =>
+              transcript.readMessageFacts({
+                idempotencyKeys: keys.filter((key) => key !== undefined),
+                activeBranchOnly: true,
+              }),
+            )
+          ).existingIdempotencyKeys;
     const persistedCount = keys.filter((key) => key && persistedKeys.has(key)).length;
     if (persistedCount > 0 && persistedCount < writes.length) {
       // The pre-atomic journal was never shipped. Partial identity is corruption,

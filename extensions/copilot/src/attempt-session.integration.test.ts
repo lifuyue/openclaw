@@ -259,11 +259,18 @@ describe("Copilot canonical session persistence", () => {
           );
           expect(result.replayMetadata.replaySafe).toBe(false);
         }
-        expect(execute).toHaveBeenCalledExactlyOnceWith("call-boundary", {}, signal, undefined);
+        const toolSignal = expectDefined(execute.mock.calls[0]?.[2], "tool execution signal");
+        expect(execute).toHaveBeenCalledExactlyOnceWith("call-boundary", {}, toolSignal, undefined);
         const session = expectDefined(sdk.sessions[0], "SDK session");
         expect(session.abort).toHaveBeenCalledTimes(outcome === "rollback" ? 1 : 0);
         expect(session.disconnect).toHaveBeenCalledOnce();
         expect(pool.release).toHaveBeenCalledOnce();
+        // Host admission composes cancellation; the caller signal need not retain identity.
+        expect(toolSignal.aborted).toBe(false);
+        const cancellation = new Error("caller cancelled the fixture");
+        controller.abort(cancellation);
+        expect(toolSignal.aborted).toBe(true);
+        expect(toolSignal.reason).toBe(cancellation);
       } finally {
         append.release();
         if (!attemptSettled) {
