@@ -266,6 +266,13 @@ in-memory session manager. The journal retains the same hooks, event identity,
 and complete tool groups without creating durable session state. Ordinary
 persistent attempts still require an exact runtime session target.
 
+Explicitly detached one-shot turns never look up or retain SDK session bindings.
+They create their own native session and delete only that fresh history after
+accepted tool work and background compaction settle, including on failure or
+cancellation. Cleanup failures are reported rather than treated as success.
+Caller-owned in-memory conversations without detached persistence remain
+resumable; they are not disposable merely because their transcript is in memory.
+
 Persistence failures stop the attempt. The first write failure marks the journal
 failed, aborts the in-flight SDK session, and flags the attempt's replay as
 unvalidated so the next run creates a fresh SDK session instead of trusting a

@@ -22,7 +22,13 @@ import type {
   CopilotAttemptParams,
   ModelRefInputObject,
 } from "./src/attempt-types.js";
-import { createCopilotByokAuth, resolveCopilotAuth, tokenFingerprint } from "./src/auth-bridge.js";
+import {
+  createCopilotByokAuth,
+  resolveCopilotAuth,
+  sessionAuthFields,
+  sessionAuthMatches,
+  tokenFingerprint,
+} from "./src/auth-bridge.js";
 import { createCopilotByokProxy } from "./src/byok-proxy.js";
 import {
   buildCopilotCompactionHookContext,
@@ -106,34 +112,6 @@ type CopilotSessionBindingStore = Pick<
   PluginStateKeyedStore<CopilotSessionBinding>,
   "delete" | "lookup" | "register"
 >;
-
-type CopilotSessionAuth = Pick<
-  CopilotSessionBinding,
-  "authMode" | "authProfileId" | "authProfileVersion"
->;
-
-function sessionAuthFields(auth: CopilotSessionAuth): CopilotSessionAuth {
-  return auth.authMode === "gitHubToken" || auth.authMode === "byok"
-    ? {
-        authMode: auth.authMode,
-        authProfileId: auth.authProfileId,
-        authProfileVersion: auth.authProfileVersion,
-      }
-    : { authMode: "useLoggedInUser" };
-}
-
-function sessionAuthMatches(stored: CopilotSessionAuth, current: CopilotSessionAuth): boolean {
-  if (stored.authMode !== current.authMode) {
-    return false;
-  }
-  if (stored.authMode === "useLoggedInUser") {
-    return true;
-  }
-  return (
-    stored.authProfileId === current.authProfileId &&
-    stored.authProfileVersion === current.authProfileVersion
-  );
-}
 
 function normalizeBinding(
   value: CopilotSessionBinding | undefined,
@@ -518,7 +496,10 @@ export function createCopilotAgentHarness(
         }
         throw error;
       }
-      const openclawSessionId = params.sessionId;
+      // An in-memory manager alone is not one-shot: memory Ask reuses it across turns.
+      // Explicitly detached runs own fresh native history, never a resumable binding.
+      const openclawSessionId =
+        params.sessionPersistence === "detached" ? undefined : params.sessionId;
 
       // Reuse the SDK session across turns within the same OpenClaw session so
       // Copilot's prompt cache, tool history, and compaction state survive.
